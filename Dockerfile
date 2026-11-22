@@ -3,3 +3,4 @@ WORKDIR /bot
 COPY bot.py .
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
 
+
