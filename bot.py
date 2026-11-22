@@ -1,828 +1,1229 @@
-#!/usr/bin/env python3
-"""MechFight / mechfight/1 survival-oriented bot. Standard library only."""
-from __future__ import annotations
-
+import sys
+import os
 import json
 import math
-import os
+import struct
 import select
-import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-Vec2 = Tuple[float, float]
-Vec3 = Tuple[float, float, float]
+import heapq
 
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+class NavMap:
+    def __init__(self, map_info, config):
+        self.terrain = None
+        self.nx = 0
+        self.ny = 0
+        self.min_x = 0.0
+        self.min_y = 0.0
+        self.step = 1.0
+        self.prisms = []
+        self.tree_buckets = {}
+        self.gs = 8.0
+        self.gx_min = -80
+        self.gy_min = -60
+        self.gw = 160
+        self.gh = 120
+        self.walkable = None
+        self.cell_z = None
+        self.adj = None
 
+        self._cache_s = -1
+        self._cache_g = -1
+        self._cache_t = -99.0
+        self._cache_path = []
 
-def wrap_angle(a: float) -> float:
-    return (a + math.pi) % (2.0 * math.pi) - math.pi
+        if not map_info:
+            return
+        mdir = map_info.get("dir", "/arena")
+        wpath = os.path.join(mdir, "v2", "world.json")
+        tpath = os.path.join(mdir, "v2", "terrain.i16")
 
-
-def xy(v: Sequence[float]) -> Vec2:
-    return (float(v[0]), float(v[1]))
-
-
-def xyz(v: Sequence[float]) -> Vec3:
-    return (float(v[0]), float(v[1]), float(v[2]) if len(v) > 2 else 0.0)
-
-
-def add2(a: Vec2, b: Vec2) -> Vec2:
-    return (a[0] + b[0], a[1] + b[1])
-
-
-def mul2(a: Vec2, k: float) -> Vec2:
-    return (a[0] * k, a[1] * k)
-
-
-def norm2(a: Vec2) -> float:
-    return math.hypot(a[0], a[1])
-
-
-def unit2(a: Vec2) -> Vec2:
-    n = norm2(a)
-    return (a[0] / n, a[1] / n) if n > 1e-9 else (0.0, 0.0)
-
-
-def dist3(a: Sequence[float], b: Sequence[float]) -> float:
-    dx = float(a[0]) - float(b[0])
-    dy = float(a[1]) - float(b[1])
-    dz = (float(a[2]) if len(a) > 2 else 0.0) - (float(b[2]) if len(b) > 2 else 0.0)
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-
-def point_in_ring(p: Vec2, ring: Sequence[float]) -> bool:
-    """Even/odd point-in-polygon test for the map's flattened [x,y,...] rings."""
-    n = len(ring) // 2
-    if n < 3:
-        return False
-    inside = False
-    x, y = p
-    j = n - 1
-    for i in range(n):
-        xi, yi = float(ring[2 * i]), float(ring[2 * i + 1])
-        xj, yj = float(ring[2 * j]), float(ring[2 * j + 1])
-        if ((yi > y) != (yj > y)):
-            cross_x = (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
-            if x < cross_x:
-                inside = not inside
-        j = i
-    return inside
-
-
-def point_segment_distance(p: Vec2, a: Vec2, b: Vec2) -> float:
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    den = dx * dx + dy * dy
-    if den <= 1e-12:
-        return norm2((p[0] - a[0], p[1] - a[1]))
-    t = clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / den, 0.0, 1.0)
-    q = (a[0] + t * dx, a[1] + t * dy)
-    return norm2((p[0] - q[0], p[1] - q[1]))
-
-
-def segments_distance(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> float:
-    # Intersection test followed by the four endpoint-to-segment distances.
-    def orient(p: Vec2, q: Vec2, r: Vec2) -> float:
-        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-    o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
-    eps = 1e-9
-    def on_segment(p: Vec2, q: Vec2, r: Vec2) -> bool:
-        return (min(p[0], r[0])-eps <= q[0] <= max(p[0], r[0])+eps and
-                min(p[1], r[1])-eps <= q[1] <= max(p[1], r[1])+eps)
-    intersects = ((o1 > eps and o2 < -eps or o1 < -eps and o2 > eps) and
-                  (o3 > eps and o4 < -eps or o3 < -eps and o4 > eps))
-    if intersects or (abs(o1) <= eps and on_segment(a, c, b)) or \
-       (abs(o2) <= eps and on_segment(a, d, b)) or \
-       (abs(o3) <= eps and on_segment(c, a, d)) or \
-       (abs(o4) <= eps and on_segment(c, b, d)):
-        return 0.0
-    return min(point_segment_distance(a, c, d), point_segment_distance(b, c, d),
-               point_segment_distance(c, a, b), point_segment_distance(d, a, b))
-
-
-class WorldMap:
-    """Small optional static obstacle model loaded once from /arena/v2/world.json."""
-    def __init__(self) -> None:
-        self.prisms: List[Dict[str, Any]] = []
-
-    def load(self, map_dir: str) -> None:
-        path = os.path.join(map_dir, "v2", "world.json")
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                world = json.load(f)
-            for p in world.get("prisms", []):
+            if not os.path.exists(wpath):
+                return
+            with open(wpath, "r") as f:
+                w = json.load(f)
+
+            ti = w.get("terrain", {})
+            self.nx = ti.get("nx", 1070)
+            self.ny = ti.get("ny", 724)
+            self.min_x = ti.get("minX", 0.0)
+            self.min_y = ti.get("minY", 0.0)
+            self.step = ti.get("step", 1.0)
+
+            if os.path.exists(tpath):
+                with open(tpath, "rb") as tf:
+                    raw = tf.read()
+                cnt = self.nx * self.ny
+                if len(raw) >= cnt * 2:
+                    self.terrain = struct.unpack(f"<{cnt}h", raw[: cnt * 2])
+
+            for p in w.get("prisms", []):
                 ring = p.get("ring", [])
                 if len(ring) < 6:
                     continue
-                xs = ring[0::2]
-                ys = ring[1::2]
+                xs, ys = ring[0::2], ring[1::2]
                 self.prisms.append({
+                    "kind": p.get("kind", "building"),
+                    "min_x": min(xs),
+                    "max_x": max(xs),
+                    "min_y": min(ys),
+                    "max_y": max(ys),
+                    "base": p.get("base", -100.0),
+                    "top": p.get("top", 100.0),
                     "ring": ring,
                     "holes": p.get("holes", []),
-                    "base": float(p.get("base", -1e9)),
-                    "top": float(p.get("top", 1e9)),
-                    "minx": min(xs), "maxx": max(xs),
-                    "miny": min(ys), "maxy": max(ys),
                 })
-        except (OSError, ValueError, TypeError):
-            self.prisms = []
+
+            t_obj = w.get("trees", {})
+            fields = t_obj.get("fields", [])
+            tdata = t_obj.get("data", [])
+            if fields and tdata:
+                stride = len(fields)
+                ix_x = fields.index("x") if "x" in fields else 0
+                ix_y = fields.index("y") if "y" in fields else 1
+                ix_r = fields.index("crownR") if "crownR" in fields else 4
+                for i in range(0, len(tdata) - stride + 1, stride):
+                    cr = tdata[i + ix_r]
+                    if cr >= 2.2:
+                        tx, ty = tdata[i + ix_x], tdata[i + ix_y]
+                        bx, by = int(math.floor(tx / 32.0)), int(math.floor(ty / 32.0))
+                        self.tree_buckets.setdefault((bx, by), []).append((tx, ty, cr))
+
+            self._build_nav_grid(w.get("bounds", {}), config)
+        except Exception:
+            self.walkable = None
+            self.adj = None
+
+    def ground_z(self, x, y):
+        if not self.terrain:
+            return 0.0
+        fx = (x - self.min_x) / self.step
+        fy = (y - self.min_y) / self.step
+        ix = max(0, min(self.nx - 2, int(fx)))
+        iy = max(0, min(self.ny - 2, int(fy)))
+        dx = max(0.0, min(1.0, fx - ix))
+        dy = max(0.0, min(1.0, fy - iy))
+        i00 = iy * self.nx + ix
+        z00 = self.terrain[i00]
+        z10 = self.terrain[i00 + 1]
+        z01 = self.terrain[i00 + self.nx]
+        z11 = self.terrain[i00 + self.nx + 1]
+        return (
+            (z00 * (1.0 - dx) + z10 * dx) * (1.0 - dy)
+            + (z01 * (1.0 - dx) + z11 * dx) * dy
+        ) * 0.01
 
     @staticmethod
-    def _solid_at(p: Vec2, ob: Dict[str, Any]) -> bool:
-        if not point_in_ring(p, ob["ring"]):
-            return False
-        return not any(point_in_ring(p, hole) for hole in ob.get("holes", []))
+    def _in_poly(x, y, ring):
+        inside = False
+        n = len(ring) // 2
+        j = n - 1
+        for i in range(n):
+            xi, yi = ring[2 * i], ring[2 * i + 1]
+            xj, yj = ring[2 * j], ring[2 * j + 1]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
 
-    def segment_clear(self, a: Vec2, b: Vec2, feet_z: float, clearance: float = 3.2) -> bool:
-        # Treat a prism as blocking when it overlaps the mech's vertical body.
-        body_top = feet_z + 9.0
-        minx, maxx = min(a[0], b[0]) - clearance, max(a[0], b[0]) + clearance
-        miny, maxy = min(a[1], b[1]) - clearance, max(a[1], b[1]) + clearance
-        for ob in self.prisms:
-            if ob["top"] <= feet_z or ob["base"] >= body_top:
-                continue
-            if ob["maxx"] < minx or ob["minx"] > maxx or ob["maxy"] < miny or ob["miny"] > maxy:
-                continue
-            if self._solid_at(a, ob) or self._solid_at(b, ob):
+    def _point_in_prism(self, x, y, z, p):
+        if z < p["base"] or z > p["top"]:
+            return False
+        if x < p["min_x"] or x > p["max_x"] or y < p["min_y"] or y > p["max_y"]:
+            return False
+        if not self._in_poly(x, y, p["ring"]):
+            return False
+        for h in p["holes"]:
+            if len(h) >= 6 and self._in_poly(x, y, h):
                 return False
-            ring = ob["ring"]
-            n = len(ring) // 2
-            # Outer wall and courtyard-hole walls both obstruct crossing.
-            rings = [ring] + list(ob.get("holes", []))
-            for r in rings:
-                m = len(r) // 2
-                for i in range(m):
-                    c = (float(r[2 * i]), float(r[2 * i + 1]))
-                    d = (float(r[2 * ((i + 1) % m)]), float(r[2 * ((i + 1) % m) + 1]))
-                    if segments_distance(a, b, c, d) < clearance:
-                        return False
         return True
 
-    def steer(self, start: Vec2, goal: Vec2, feet_z: float) -> Vec2:
-        if not self.prisms or self.segment_clear(start, goal, feet_z):
-            return unit2((goal[0] - start[0], goal[1] - start[1]))
+    def _build_nav_grid(self, bounds, config):
+        gs = self.gs
+        x0 = bounds.get("minX", self.min_x)
+        y0 = bounds.get("minY", self.min_y)
+        x1 = bounds.get("maxX", self.min_x + self.nx * self.step)
+        y1 = bounds.get("maxY", self.min_y + self.ny * self.step)
 
-        # Try short detours just outside corners of nearby blocking prisms.
-        direct = (goal[0] - start[0], goal[1] - start[1])
-        reach = norm2(direct)
-        minx, maxx = min(start[0], goal[0]) - 12, max(start[0], goal[0]) + 12
-        miny, maxy = min(start[1], goal[1]) - 12, max(start[1], goal[1]) + 12
-        candidates: List[Vec2] = []
-        for ob in self.prisms:
-            if ob["top"] <= feet_z or ob["base"] >= feet_z + 9.0:
-                continue
-            if ob["maxx"] < minx or ob["minx"] > maxx or ob["maxy"] < miny or ob["miny"] > maxy:
-                continue
-            r = ob["ring"]
-            cx = sum(float(r[i]) for i in range(0, len(r), 2)) / (len(r) // 2)
-            cy = sum(float(r[i]) for i in range(1, len(r), 2)) / (len(r) // 2)
-            for i in range(0, len(r), 2):
-                vx, vy = float(r[i]), float(r[i + 1])
-                out = unit2((vx - cx, vy - cy))
-                candidates.append((vx + out[0] * 5.0, vy + out[1] * 5.0))
-        best: Optional[Vec2] = None
-        best_cost = float("inf")
-        for w in candidates:
-            if norm2((w[0] - start[0], w[1] - start[1])) > max(100.0, reach + 20.0):
-                continue
-            if not self.segment_clear(start, w, feet_z) or not self.segment_clear(w, goal, feet_z):
-                continue
-            cost = norm2((w[0] - start[0], w[1] - start[1])) + norm2((goal[0] - w[0], goal[1] - w[1]))
-            if cost < best_cost:
-                best_cost, best = cost, w
-        if best is not None:
-            return unit2((best[0] - start[0], best[1] - start[1]))
+        self.gx_min = int(math.floor(x0 / gs))
+        self.gy_min = int(math.floor(y0 / gs))
+        self.gw = max(10, int(math.ceil((x1 - x0) / gs)) + 1)
+        self.gh = max(10, int(math.ceil((y1 - y0) / gs)) + 1)
 
-        # Last-resort wall-following direction; server collision still slides along walls.
-        d = unit2(direct)
-        side1, side2 = (-d[1], d[0]), (d[1], -d[0])
-        if self.segment_clear(start, (start[0] + side1[0] * 14, start[1] + side1[1] * 14), feet_z):
-            return side1
-        if self.segment_clear(start, (start[0] + side2[0] * 14, start[1] + side2[1] * 14), feet_z):
-            return side2
-        return mul2(d, -1.0)
+        total = self.gw * self.gh
+        walk = [False] * total
+        cell_z = [0.0] * total
 
+        b_size = 32.0
+        buckets = {}
+        for p in self.prisms:
+            bx0 = int(math.floor((p["min_x"] - 3.0) / b_size))
+            bx1 = int(math.ceil((p["max_x"] + 3.0) / b_size))
+            by0 = int(math.floor((p["min_y"] - 3.0) / b_size))
+            by1 = int(math.ceil((p["max_y"] + 3.0) / b_size))
+            for bx in range(bx0, bx1 + 1):
+                for by in range(by0, by1 + 1):
+                    buckets.setdefault((bx, by), []).append(p)
 
-class MechSurvivor:
-    def __init__(self) -> None:
-        self.config: Dict[str, Any] = {}
-        self.world = WorldMap()
-        self.scan_yaw = 0.0
-        self.wander_angle = 0.0
-        self.last_aim = [0.0, 0.0]
-        self.last_target_id: Optional[int] = None
-        self.tick_dt = 0.1
-
-    def on_hello(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        self.config = msg.get("config", {}) or {}
-        map_dir = (msg.get("map") or {}).get("dir", "/arena")
-        self.world.load(map_dir)
-        self.scan_yaw = 0.0
-        return {"type": "ready", "name": "MechSurvivor-Pro"}
-
-    def zone_state(self, obs: Dict[str, Any]) -> Tuple[Vec2, float, bool]:
-        z = obs.get("zone", {}) or {}
-        center = xy(z.get("center", [0.0, 0.0]))
-        next_center = xy(z.get("next_center", center))
-        radius = float(z.get("radius", 500.0))
-        next_radius = float(z.get("next_radius", radius))
-        t = float(obs.get("t", 0.0))
-        start = float(z.get("shrink_start", 1e9))
-        end = float(z.get("shrink_end", 1e9))
-        urgent = False
-        if end > start and start <= t <= end:
-            a = clamp((t - start) / (end - start), 0.0, 1.0)
-            center = (center[0] + (next_center[0] - center[0]) * a,
-                      center[1] + (next_center[1] - center[1]) * a)
-            radius = radius + (next_radius - radius) * a
-            urgent = True
-        elif t > end:
-            center, radius = next_center, next_radius
-        elif start - t < 25.0 and start < 1e8:
-            # Prepare for the next circle, but only when outside its comfortable interior.
-            p = self._position(obs)
-            if norm2((p[0] - next_center[0], p[1] - next_center[1])) > next_radius - 25.0:
-                center, radius = next_center, next_radius
-                urgent = True
-        p = self._position(obs)
-        outside = norm2((p[0] - center[0], p[1] - center[1])) > radius - 18.0
-        return center, max(0.0, radius), bool(urgent or outside)
-
-    @staticmethod
-    def _position(obs: Dict[str, Any]) -> Vec3:
-        return xyz(obs.get("self", {}).get("pos", [0.0, 0.0, 0.0]))
-
-    def _enemy_threat(self, me: Dict[str, Any], enemy: Dict[str, Any], d: float) -> float:
-        epos = xyz(enemy.get("pos", [0, 0, 0]))
-        mpos = xyz(me.get("pos", [0, 0, 0]))
-        eaim = enemy.get("aim", [0.0, 0.0])
-        bearing_to_me = math.atan2(mpos[1] - epos[1], mpos[0] - epos[0])
-        facing = abs(wrap_angle(float(eaim[0]) - bearing_to_me)) if len(eaim) else math.pi
-        threat = 0.0
-        if facing < 0.55:
-            threat += 18.0
-        if enemy.get("charging"):
-            threat += 18.0
-        kinds = enemy.get("weapons", []) or []
-        if "lightning" in kinds and d < 55:
-            threat += 12.0
-        if "mortar" in kinds and d < 120:
-            threat += 8.0
-        if "laser" in kinds and d < 180:
-            threat += 8.0
-        return threat
-
-    def choose_target(self, obs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        me = obs.get("self", {})
-        my_pos = me.get("pos", [0, 0, 0])
-        best = None
-        best_score = float("inf")
-        for e in obs.get("mechs", []) or []:
-            if e.get("id") == me.get("id") or not e.get("pos"):
-                continue
-            kind = e.get("kind", "mech")
-            if kind not in ("mech", "npc"):
-                continue
-            d = dist3(my_pos, e["pos"])
-            hp = float(e.get("hp", 700.0))
-            max_hp = max(1.0, float(e.get("max_hp", 1400.0 if kind == "mech" else 350.0)))
-            hp_fraction = clamp(hp / max_hp, 0.0, 1.0)
-            score = d + hp_fraction * 18.0 - self._enemy_threat(me, e, d)
-            if kind == "npc":
-                score += 24.0  # Drones are useful cubes, but players are the immediate placement threat.
-            if e.get("id") == self.last_target_id:
-                score -= 4.0  # Reduce target switching when scores are close.
-            if score < best_score:
-                best_score, best = score, e
-        if best is not None:
-            self.last_target_id = best.get("id")
-        return best
-
-    @staticmethod
-    def _target_scale(target: Dict[str, Any]) -> float:
-        return 1.0 + 0.05 * max(0.0, float(target.get("cubes", 0)))
-
-    def _intercept_time(self, r: Vec3, v: Vec3, speed: float) -> float:
-        # Earliest positive solution of |r + v*t| = speed*t.
-        a = v[0]*v[0] + v[1]*v[1] + v[2]*v[2] - speed*speed
-        b = 2.0 * (r[0]*v[0] + r[1]*v[1] + r[2]*v[2])
-        c = r[0]*r[0] + r[1]*r[1] + r[2]*r[2]
-        if abs(a) < 1e-9:
-            t = -c / b if abs(b) > 1e-9 else 0.0
-            return clamp(t, 0.0, 1.8)
-        disc = b*b - 4.0*a*c
-        if disc < 0.0:
-            return clamp(math.sqrt(c) / max(speed, 1.0), 0.0, 1.8)
-        root = math.sqrt(disc)
-        roots = [t for t in ((-b-root)/(2*a), (-b+root)/(2*a)) if t > 0.0]
-        return clamp(min(roots) if roots else math.sqrt(c) / max(speed, 1.0), 0.0, 1.8)
-
-    def aim_at(self, me: Dict[str, Any], target: Dict[str, Any], weapon: Dict[str, Any]) -> Tuple[List[float], float, float]:
-        mpos = xyz(me.get("pos", [0, 0, 0]))
-        tpos = xyz(target.get("pos", [0, 0, 0]))
-        vel = xyz(target.get("vel", [0, 0, 0]))
-        kind = weapon.get("kind", "gun")
-        my_stats = me.get("stats", {}) or {}
-        muzzle_scale = float(my_stats.get("muzzle_height", 7.0)) / 7.0
-        muzzle_h = (9.5 if kind == "mortar" else float(my_stats.get("muzzle_height", 7.0))) * (muzzle_scale if kind == "mortar" else 1.0)
-        target_scale = self._target_scale(target)
-        target_h = (1.75 if target.get("kind") == "npc" else 4.5) * target_scale
-        muzzle = (mpos[0], mpos[1], mpos[2] + muzzle_h)
-        aim_point = (tpos[0], tpos[1], tpos[2] + target_h)
-        stats = weapon.get("stats", {}) or {}
-        distance = dist3(mpos, tpos)
-
-        if kind == "gun":
-            speed = float(stats.get("speed", 252.0))
-            r = (aim_point[0]-muzzle[0], aim_point[1]-muzzle[1], aim_point[2]-muzzle[2])
-            flight = self._intercept_time(r, vel, speed)
-            aim_point = (aim_point[0] + vel[0]*flight,
-                         aim_point[1] + vel[1]*flight,
-                         aim_point[2] + vel[2]*flight)
-        elif kind == "mortar":
-            speed = float(stats.get("speed", 72.0))
-            gravity = float(stats.get("gravity", (self.config.get("weapons", {}).get("mortar", {}) or {}).get("gravity", 22.0)))
-            # Iterate once on horizontal flight time, then solve the low ballistic arc.
-            for _ in range(2):
-                dx, dy = aim_point[0]-muzzle[0], aim_point[1]-muzzle[1]
-                horizontal = math.hypot(dx, dy)
-                dz = aim_point[2]-muzzle[2]
-                if horizontal < 1e-3:
-                    pitch = math.pi / 4.0
-                    flight = 0.2
-                else:
-                    disc = speed**4 - gravity * (gravity*horizontal*horizontal + 2.0*dz*speed*speed)
-                    if disc <= 0.0:
-                        pitch = math.radians(43.0)
-                    else:
-                        tan_pitch = (speed*speed - math.sqrt(disc)) / (gravity*horizontal)
-                        pitch = math.atan(tan_pitch)
-                    flight = horizontal / max(1.0, speed * math.cos(pitch))
-                aim_point = (tpos[0] + vel[0]*flight,
-                             tpos[1] + vel[1]*flight,
-                             tpos[2] + target_h + vel[2]*flight)
-            dx, dy = aim_point[0]-muzzle[0], aim_point[1]-muzzle[1]
-            yaw = math.atan2(dy, dx)
-            return [yaw, clamp(pitch, -0.2, 1.25)], distance, flight
-        else:
-            # Laser is hitscan; lightning uses yaw but benefits from small lead while the torso turns.
-            cur = me.get("aim", [0.0, 0.0])
-            turn_rate = float(my_stats.get("turn_rate", 4.0))
-            delay = min(0.35, abs(wrap_angle(math.atan2(aim_point[1]-mpos[1], aim_point[0]-mpos[0]) - float(cur[0]))) / max(turn_rate, 0.1))
-            aim_point = (aim_point[0] + vel[0]*delay, aim_point[1] + vel[1]*delay, aim_point[2] + vel[2]*delay)
-
-        dx, dy, dz = aim_point[0]-muzzle[0], aim_point[1]-muzzle[1], aim_point[2]-muzzle[2]
-        yaw = math.atan2(dy, dx)
-        pitch = math.atan2(dz, max(1e-6, math.hypot(dx, dy)))
-        pitch = clamp(pitch, float(my_stats.get("min_pitch", -1.2)), float(my_stats.get("max_pitch", 1.2)))
-        return [yaw, pitch], distance, 0.0
-
-    def _after_turn_error(self, me: Dict[str, Any], aim: Sequence[float]) -> Tuple[float, float]:
-        cur = me.get("aim", [0.0, 0.0])
-        stats = me.get("stats", {}) or {}
-        yaw_rate = max(0.1, float(stats.get("turn_rate", 4.0)))
-        pitch_rate = max(0.1, float(stats.get("pitch_rate", yaw_rate)))
-        dyaw = wrap_angle(float(aim[0]) - float(cur[0]))
-        dpitch = float(aim[1]) - float(cur[1])
-        return (max(0.0, abs(dyaw) - yaw_rate*self.tick_dt),
-                max(0.0, abs(dpitch) - pitch_rate*self.tick_dt))
-
-    def choose_weapon_slot(self, me: Dict[str, Any], target: Dict[str, Any], d: float) -> Optional[int]:
-        weapons = me.get("weapons", [None, None]) or [None, None]
-        kinds = target.get("weapons", []) or []
-        best_slot, best_score = None, -1e9
-        for slot in range(min(2, len(weapons))):
-            w = weapons[slot]
-            if not w:
-                continue
-            kind = w.get("kind", "gun")
-            cd = float(w.get("cooldown", 0.0))
-            charge = float(w.get("charge", 0.0))
-            if kind == "laser" and charge > 0.0:
-                return slot
-            score = -100.0
-            stats = w.get("stats", {}) or {}
-            rng = float(stats.get("range", {"gun":230.0, "laser":280.0, "mortar":235.0, "lightning":45.0}.get(kind, 100.0)))
-            if kind == "gun":
-                ammo = int(w.get("ammo", 0))
-                if ammo > 0 and d <= rng:
-                    score = 45.0 + (8.0 if d < 100 else 0.0)
-            elif kind == "laser" and d <= rng:
-                score = 82.0
-                if "mortar" in kinds:
-                    score += 18.0
-                if "lightning" in kinds and d < 50:
-                    score -= 28.0
-            elif kind == "mortar" and 14.0 < d <= rng:
-                score = 68.0 + (20.0 if "lightning" in kinds else 0.0)
-            elif kind == "lightning" and d <= rng:
-                score = 72.0 + (24.0 if "laser" in kinds else 0.0)
-                if float(me.get("energy", 0.0)) < 3.0:
-                    score = -100.0
-            if score > -90.0 and cd > 0.0:
-                score -= min(35.0, cd * 18.0)
-            if score > best_score:
-                best_score, best_slot = score, slot
-        return best_slot
-
-    def _select_upgrade(self, obs: Dict[str, Any]) -> Optional[int]:
-        offer = obs.get("offer")
-        if not offer:
-            return None
-        choices = offer.get("choices", []) or []
-        if not choices:
-            return None
-        weapons = [w.get("kind") for w in (obs.get("self", {}).get("weapons", []) or []) if w]
-        def rank(c: Dict[str, Any]) -> int:
-            label = (str(c.get("id", "")) + " " + str(c.get("name", "")) + " " + str(c.get("desc", ""))).lower()
-            score = 0
-            if any(k in label for k in ("armor", "damage taken", "resist")):
-                score += 100
-            if any(k in label for k in ("max hp", "max health", "health", "regen", "repair")):
-                score += 90
-            if any(k in label for k in ("walk", "move speed", "boost speed", "mobility", "accel")):
-                score += 75
-            if any(k in label for k in ("energy", "jet", "fuel")):
-                score += 65
-            if any(k in label for k in ("sensor", "vision", "radar", "range")):
-                score += 60
-            if "gun" in label and "gun" in weapons:
-                score += 82
-            if "laser" in label and "laser" in weapons:
-                score += 88
-            if "mortar" in label and "mortar" in weapons:
-                score += 78
-            if "lightning" in label and "lightning" in weapons:
-                score += 78
-            if any(k in label for k in ("damage", "rate", "cooldown", "reload")):
-                score += 40
-            return score
-        return max(range(len(choices)), key=lambda i: rank(choices[i]))
-
-    def _best_goal(self, obs: Dict[str, Any], zone_center: Vec2, zone_radius: float) -> Optional[Vec2]:
-        me = obs.get("self", {})
-        p = xyz(me.get("pos", [0, 0, 0]))
-        my2 = (p[0], p[1])
-        enemies = [e for e in (obs.get("mechs", []) or []) if e.get("kind") == "mech" and e.get("pos")]
-        nearest_enemy = min((dist3(p, e["pos"]) for e in enemies), default=9999.0)
-
-        def safe(q: Sequence[float]) -> bool:
-            return norm2((float(q[0])-zone_center[0], float(q[1])-zone_center[1])) < max(0.0, zone_radius-12.0)
-
-        # A contested supply drop is usually not worth the risk; capture only if alone or already holding it.
-        my_id = me.get("id")
-        for drop in sorted(obs.get("drops", []) or [], key=lambda d: dist3(p, d.get("pos", [1e9, 1e9, 0]))):
-            if float(drop.get("lands_in", 999.0)) > 0.0:
-                continue
-            holder = drop.get("holder")
-            if holder not in (None, my_id):
-                continue
-            dp = drop.get("pos")
-            if not dp or not safe(dp):
-                continue
-            contest = any(dist3(e["pos"], dp) < 22.0 for e in enemies)
-            d = dist3(p, dp)
-            if not contest and d < 130.0 and (holder == my_id or nearest_enemy > 28.0):
-                return (float(dp[0]), float(dp[1]))
-
-        # Collect nearby cubes only when doing so does not mean walking into an immediate fight.
-        cubes = []
-        if nearest_enemy > 16.0:
-            for c in obs.get("cubes", []) or []:
-                cp = c.get("pos")
-                if cp and safe(cp):
-                    d = dist3(p, cp)
-                    if d < 48.0:
-                        cubes.append((d, cp))
-        if cubes:
-            cp = min(cubes, key=lambda x: x[0])[1]
-            return (float(cp[0]), float(cp[1]))
-
-        # Fill the empty secondary slot with the best nearby weapon.
-        weapons = me.get("weapons", []) or []
-        has_secondary = len(weapons) > 1 and weapons[1] is not None
-        if not has_secondary and nearest_enemy > 22.0:
-            preference = {"laser": 0, "mortar": 1, "lightning": 2}
-            pickups = []
-            for item in obs.get("pickups", []) or []:
-                wp = item.get("pos")
-                kind = item.get("kind")
-                if wp and kind in preference and safe(wp):
-                    d = dist3(p, wp)
-                    if d < 55.0:
-                        pickups.append((d, preference[kind], wp))
-            if pickups:
-                chosen = min(pickups, key=lambda x: (x[0] - 3.0*x[1]))
-                return (float(chosen[2][0]), float(chosen[2][1]))
-        return None
-
-    def _projectile_evasion(self, obs: Dict[str, Any]) -> Tuple[Vec2, float]:
-        me = obs.get("self", {})
-        p = xyz(me.get("pos", [0, 0, 0]))
-        v = xyz(me.get("vel", [0, 0, 0]))
-        gravity = float((self.config.get("weapons", {}).get("mortar", {}) or {}).get("gravity", 22.0))
-        evasion = (0.0, 0.0)
-        danger = 0.0
-        for shot in obs.get("projectiles", []) or []:
-            sp = shot.get("pos")
-            sv = shot.get("vel")
-            if not sp or not sv:
-                continue
-            sp3, sv3 = xyz(sp), xyz(sv)
-            mortar = shot.get("kind") == "mortar"
-            best_d2, best_t, best_rel = 1e18, 0.0, (0.0, 0.0)
-            for step in range(1, 11):
-                t = step * 0.1
-                sx = sp3[0] + sv3[0]*t
-                sy = sp3[1] + sv3[1]*t
-                sz = sp3[2] + sv3[2]*t - (0.5*gravity*t*t if mortar else 0.0)
-                mx, my, mz = p[0]+v[0]*t, p[1]+v[1]*t, p[2]+v[2]*t
-                dx, dy, dz = sx-mx, sy-my, sz-mz
-                # Treat the mech as a vertical cylinder, not a point.
-                if -1.0 <= dz <= 10.0:
-                    d2 = dx*dx + dy*dy
-                    if d2 < best_d2:
-                        best_d2, best_t, best_rel = d2, t, (dx, dy)
-            if best_d2 < 8.0*8.0:
-                severity = (8.0 - math.sqrt(best_d2)) / 8.0
-                away = unit2((-best_rel[0], -best_rel[1]))
-                evasion = add2(evasion, mul2(away, severity * (1.0 + 0.8 * (1.0-best_t))))
-                danger = max(danger, severity)
-        return evasion, danger
-
-    def _movement(self, obs: Dict[str, Any], zone_center: Vec2, zone_radius: float, urgent_zone: bool) -> Tuple[List[float], bool, bool]:
-        me = obs.get("self", {})
-        p = xyz(me.get("pos", [0, 0, 0]))
-        my2 = (p[0], p[1])
-        energy = float(me.get("energy", 0.0))
-        goal = self._best_goal(obs, zone_center, zone_radius)
-        to_zone = (zone_center[0] - p[0], zone_center[1] - p[1])
-        zone_dist = norm2(to_zone)
-        outside = zone_dist > zone_radius - 18.0
-
-        if outside or urgent_zone:
-            desired = unit2(to_zone)
-            # If we're only preparing for the next circle, don't abandon a close safe loot target.
-            if goal is not None and not outside and zone_dist < zone_radius - 35.0:
-                desired = unit2((goal[0]-p[0], goal[1]-p[1]))
-        elif goal is not None:
-            desired = self.world.steer(my2, goal, p[2])
-        else:
-            # Patrol an inner orbit instead of standing still; this avoids camping at the edge.
-            self.wander_angle = wrap_angle(self.wander_angle + 0.045)
-            orbit_r = min(150.0, max(18.0, zone_radius * 0.38))
-            orbit = (zone_center[0] + math.cos(self.wander_angle)*orbit_r,
-                     zone_center[1] + math.sin(self.wander_angle)*orbit_r)
-            if norm2((orbit[0]-p[0], orbit[1]-p[1])) > 8.0:
-                desired = self.world.steer(my2, orbit, p[2])
-            else:
-                desired = unit2((-math.sin(self.wander_angle), math.cos(self.wander_angle)))
-
-        # Repel from nearby enemy mechs. Keep a little separation rather than blindly chasing.
-        repulse = (0.0, 0.0)
-        closest = 9999.0
-        for e in obs.get("mechs", []) or []:
-            if e.get("kind") != "mech" or e.get("id") == me.get("id") or not e.get("pos"):
-                continue
-            ep = xyz(e["pos"])
-            delta = (p[0]-ep[0], p[1]-ep[1])
-            d = max(0.1, norm2(delta))
-            closest = min(closest, d)
-            if d < 85.0:
-                strength = ((85.0-d)/85.0)**2
-                repulse = add2(repulse, mul2(delta, strength / d))
-        if norm2(repulse) > 0:
-            desired = unit2(add2(desired, mul2(unit2(repulse), 1.9 if closest < 35.0 else 1.0)))
-
-        evasion, projectile_danger = self._projectile_evasion(obs)
-        if projectile_danger > 0.0:
-            desired = unit2(add2(desired, mul2(unit2(evasion), 2.4)))
-
-        move = unit2(desired)
-        urgent = outside or projectile_danger > 0.25 or closest < 24.0
-        boost_threshold = 8.0 if outside else 24.0 if urgent else 78.0 if goal is not None else 95.0
-        boost = bool(norm2(move) > 0.05 and energy > boost_threshold)
-        # Jump only for an imminent projectile close to the body; lateral evasion remains primary.
-        jump = bool(me.get("grounded", False) and projectile_danger > 0.88 and closest > 8.0)
-        return [move[0], move[1]], boost, jump
-
-    def _aim_without_target(self, obs: Dict[str, Any]) -> List[float]:
-        me = obs.get("self", {})
-        actual = me.get("aim", self.last_aim)
-        desired_yaw: Optional[float] = None
-        # Damage bearing is the best immediate defensive cue.
-        for event in reversed(obs.get("events", []) or []):
-            if event.get("type") == "damaged" and event.get("bearing") is not None:
-                desired_yaw = float(event["bearing"])
-                break
-        if desired_yaw is None:
-            sounds = [s for s in (obs.get("sounds", []) or []) if s.get("bearing") is not None and float(s.get("age", 99.0)) < 0.8]
-            if sounds:
-                weight = {"mortar": 5, "laser": 4, "lightning": 4, "explosion": 3, "gun": 2, "npc_gun": 1, "jet": 1}
-                sound = min(sounds, key=lambda s: (float(s.get("age", 0.0)), -weight.get(s.get("kind", ""), 0)))
-                desired_yaw = float(sound["bearing"])
-        if desired_yaw is None:
-            if self.scan_yaw == 0.0:
-                self.scan_yaw = float(actual[0])
-            self.scan_yaw = wrap_angle(self.scan_yaw + 0.32)
-            desired_yaw = self.scan_yaw
-        return [wrap_angle(desired_yaw), 0.0]
-
-    def decide(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        me = obs.get("self", {}) or {}
-        tick = int(obs.get("tick", 0))
-        zone_center, zone_radius, urgent_zone = self.zone_state(obs)
-        move, boost, jump = self._movement(obs, zone_center, zone_radius, urgent_zone)
-        target = self.choose_target(obs)
-        weapons = me.get("weapons", [None, None]) or [None, None]
-        if len(weapons) < 2:
-            weapons = list(weapons) + [None] * (2-len(weapons))
-        fire = [False, False]
-        reload_gun = False
-        aim = self._aim_without_target(obs)
-        selected_slot: Optional[int] = None
-        target_distance = 1e9
-
-        if target is not None:
-            target_distance = dist3(me.get("pos", [0,0,0]), target.get("pos", [0,0,0]))
-            selected_slot = self.choose_weapon_slot(me, target, target_distance)
-            if selected_slot is None:
-                selected_slot = next((i for i, w in enumerate(weapons[:2]) if w), None)
-            if selected_slot is not None and weapons[selected_slot]:
-                weapon = weapons[selected_slot]
-                aim, _, _ = self.aim_at(me, target, weapon)
-                yaw_err, pitch_err = self._after_turn_error(me, aim)
-                aligned = math.hypot(yaw_err, pitch_err) < 0.14
-                kind = weapon.get("kind", "gun")
-                stats = weapon.get("stats", {}) or {}
-                max_range = float(stats.get("range", {"gun":230.0, "laser":280.0, "mortar":235.0, "lightning":45.0}.get(kind, 100.0)))
-                cooldown = float(weapon.get("cooldown", 0.0))
-                if kind == "gun":
-                    ammo = int(weapon.get("ammo", 0))
-                    if ammo <= 0:
-                        reload_gun = float(weapon.get("reload", 0.0)) <= 0.0
-                    elif cooldown <= 0.0 and target_distance <= max_range and aligned:
-                        fire[selected_slot] = True
-                elif kind == "mortar":
-                    if cooldown <= 0.0 and 15.0 < target_distance < min(max_range, 220.0) and aligned:
-                        # Avoid own splash at close range.
-                        fire[selected_slot] = True
-                elif kind == "lightning":
-                    yaw_only_ok = yaw_err < math.radians(13.0)
-                    if cooldown <= 0.0 and target_distance <= min(max_range, 45.0) and yaw_only_ok and float(me.get("energy", 0.0)) >= 3.0:
-                        fire[selected_slot] = True
-                elif kind == "laser":
-                    charge = float(weapon.get("charge", 0.0))
-                    if charge > 0.0:
-                        # Charge while tracking; release on a good line or near full charge.
-                        fire[selected_slot] = not ((charge >= 0.48 and aligned and yaw_err < 0.07) or charge >= 0.72)
-                    elif cooldown <= 0.0 and target_distance <= max_range:
-                        fire[selected_slot] = True
-
-        # A charging laser with no target must be released rather than charging indefinitely.
-        for i, w in enumerate(weapons[:2]):
-            if w and w.get("kind") == "laser" and float(w.get("charge", 0.0)) > 0.0 and target is None:
-                fire[i] = False
-
-        # Reload the arm gun early when it is nearly empty and there is no immediate shot.
-        for i, w in enumerate(weapons[:2]):
-            if w and w.get("kind") == "gun":
-                ammo = int(w.get("ammo", 0))
-                if float(w.get("reload", 0.0)) <= 0.0 and ammo <= 2 and (target is None or target_distance > 45.0):
-                    reload_gun = True
-
-        pick = self._select_upgrade(obs)
-        action: Dict[str, Any] = {
-            "tick": tick,
-            "move": move,
-            "boost": boost,
-            "jump": jump,
-            "aim": [float(aim[0]), float(aim[1])],
-            "fire": fire,
-            "reload": reload_gun,
-        }
-        if pick is not None:
-            action["pick"] = pick
-
-        # Take a weapon only when the secondary slot is empty and the pickup is in interaction range.
-        if len(weapons) > 1 and weapons[1] is None:
-            p = xyz(me.get("pos", [0,0,0]))
-            best_pickup = None
-            best_score = 1e9
-            pref = {"laser": 0, "mortar": 1, "lightning": 2}
-            for item in obs.get("pickups", []) or []:
-                wp = item.get("pos")
-                if not wp or item.get("kind") not in pref:
+        offsets = ((0.0, 0.0), (1.8, 0.0), (-1.8, 0.0), (0.0, 1.8), (0.0, -1.8))
+        for gy in range(self.gh):
+            cy = (self.gy_min + gy + 0.5) * gs
+            by = int(math.floor(cy / b_size))
+            row = gy * self.gw
+            for gx in range(self.gw):
+                cx = (self.gx_min + gx + 0.5) * gs
+                if cx < x0 + 3.0 or cx > x1 - 3.0 or cy < y0 + 3.0 or cy > y1 - 3.0:
                     continue
-                dxy = norm2((float(wp[0])-p[0], float(wp[1])-p[1]))
-                dz = abs(float(wp[2] if len(wp)>2 else 0.0)-p[2])
-                if dxy <= 4.0 and dz <= 4.0:
-                    score = dxy + dz + pref[item["kind"]]*0.1
-                    if score < best_score:
-                        best_score, best_pickup = score, item
-            if best_pickup is not None:
-                action["take"] = int(best_pickup["id"])
+                gz = self.ground_z(cx, cy)
+                cell_z[row + gx] = gz
+                cand = buckets.get((int(math.floor(cx / b_size)), by), ())
+                blocked = False
+                for p in cand:
+                    if gz + 8.5 <= p["base"] + 1.2 or gz >= p["top"]:
+                        continue
+                    for ox, oy in offsets:
+                        px, py = cx + ox, cy + oy
+                        if self._point_in_prism(px, py, gz + 2.5, p) or self._point_in_prism(px, py, gz + 7.5, p):
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                if not blocked:
+                    walk[row + gx] = True
 
-        self.last_aim = list(action["aim"])
-        return action
+        adj = [[] for _ in range(total)]
+        dirs = (
+            (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+            (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414),
+        )
+        for gy in range(self.gh):
+            row = gy * self.gw
+            for gx in range(self.gw):
+                u = row + gx
+                if not walk[u]:
+                    continue
+                zu = cell_z[u]
+                nbrs = adj[u]
+                for dx, dy, cost in dirs:
+                    nx, ny = gx + dx, gy + dy
+                    if 0 <= nx < self.gw and 0 <= ny < self.gh:
+                        v = ny * self.gw + nx
+                        if not walk[v]:
+                            continue
+                        if dx != 0 and dy != 0:
+                            if not (walk[row + nx] and walk[ny * self.gw + gx]):
+                                continue
+                        dz = cell_z[v] - zu
+                        if dz <= 8.5 * cost:
+                            extra = 1.5 if dz > 1.3 else 0.0
+                            nbrs.append((v, cost + extra))
+
+        self.walkable = walk
+        self.cell_z = cell_z
+        self.adj = adj
+
+    def world_to_cell(self, x, y):
+        gx = max(0, min(self.gw - 1, int(math.floor(x / self.gs)) - self.gx_min))
+        gy = max(0, min(self.gh - 1, int(math.floor(y / self.gs)) - self.gy_min))
+        return gy * self.gw + gx
+
+    def cell_to_world(self, idx):
+        gy, gx = divmod(idx, self.gw)
+        return (self.gx_min + gx + 0.5) * self.gs, (self.gy_min + gy + 0.5) * self.gs
+
+    def nearest_walkable(self, x, y):
+        if not self.walkable:
+            return -1
+        c = self.world_to_cell(x, y)
+        if self.walkable[c]:
+            return c
+        gy0, gx0 = divmod(c, self.gw)
+        for r in range(1, 10):
+            for dy in range(-r, r + 1):
+                ny = gy0 + dy
+                if not (0 <= ny < self.gh):
+                    continue
+                for dx in range(-r, r + 1):
+                    if abs(dx) != r and abs(dy) != r:
+                        continue
+                    nx = gx0 + dx
+                    if 0 <= nx < self.gw:
+                        idx = ny * self.gw + nx
+                        if self.walkable[idx]:
+                            return idx
+        return -1
+
+    def line_walkable(self, x0, y0, x1, y1):
+        if not self.walkable:
+            return True
+        dist = math.hypot(x1 - x0, y1 - y0)
+        steps = max(2, int(dist / 4.0))
+        for i in range(1, steps + 1):
+            t = i / steps
+            if not self.walkable[self.world_to_cell(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)]:
+                return False
+        return True
+
+    def build_danger_grid(self, threats):
+        if not self.walkable or not threats:
+            return None
+        danger = [0.0] * (self.gw * self.gh)
+        gs = self.gs
+        gw = self.gw
+        gh = self.gh
+        for tx, ty, tr, weight in threats:
+            cx = int(math.floor(tx / gs)) - self.gx_min
+            cy = int(math.floor(ty / gs)) - self.gy_min
+            rc = int(math.ceil(tr / gs))
+            for gy in range(max(0, cy - rc), min(gh, cy + rc + 1)):
+                row = gy * gw
+                dy = gy - cy
+                for gx in range(max(0, cx - rc), min(gw, cx + rc + 1)):
+                    d = math.hypot(gx - cx, dy)
+                    if d < tr / gs:
+                        danger[row + gx] += (tr / gs - d) * weight
+        return danger
+
+    def find_path_dir(self, start_pos, goal_xy, danger_grid=None, now_t=0.0):
+        dx = goal_xy[0] - start_pos[0]
+        dy = goal_xy[1] - start_pos[1]
+        d = math.hypot(dx, dy)
+        if d < 1e-4:
+            return 0.0, 0.0, False
+        if not self.walkable or not self.adj:
+            return dx / d, dy / d, False
+
+        if d < 28.0 and not danger_grid and self.line_walkable(start_pos[0], start_pos[1], goal_xy[0], goal_xy[1]):
+            ux, uy = dx / d, dy / d
+            step_up = (self.ground_z(start_pos[0] + ux * 3.0, start_pos[1] + uy * 3.0) - start_pos[2]) > 1.05
+            return ux, uy, step_up
+
+        s = self.nearest_walkable(start_pos[0], start_pos[1])
+        g = self.nearest_walkable(goal_xy[0], goal_xy[1])
+        if s < 0 or g < 0 or s == g:
+            return dx / d, dy / d, False
+
+        # Reuse cached path for 0.4s if start/goal cells match and no active danger grid
+        if (
+            not danger_grid
+            and (now_t - self._cache_t) < 0.40
+            and s == self._cache_s
+            and g == self._cache_g
+            and len(self._cache_path) > 1
+        ):
+            path = self._cache_path
+        else:
+            gy_g, gx_g = divmod(g, self.gw)
+            open_heap = [(0.0, s)]
+            came_from = {s: -1}
+            g_score = {s: 0.0}
+            adj = self.adj
+            gw = self.gw
+            best_node = s
+            best_h = 1e9
+            expansions = 0
+
+            while open_heap and expansions < 480:
+                _, cur = heapq.heappop(open_heap)
+                if cur == g:
+                    best_node = g
+                    break
+                expansions += 1
+                cy, cx = divmod(cur, gw)
+                adx, ady = abs(gx_g - cx), abs(gy_g - cy)
+                h_cur = max(adx, ady) + 0.414 * min(adx, ady)
+                if h_cur < best_h:
+                    best_h = h_cur
+                    best_node = cur
+
+                gc = g_score[cur]
+                for nxt, step_cost in adj[cur]:
+                    pen = danger_grid[nxt] if danger_grid else 0.0
+                    ng = gc + step_cost + pen
+                    if ng < g_score.get(nxt, 1e9):
+                        g_score[nxt] = ng
+                        came_from[nxt] = cur
+                        ny, nx = divmod(nxt, gw)
+                        ddx, ddy = abs(gx_g - nx), abs(gy_g - ny)
+                        h = max(ddx, ddy) + 0.414 * min(ddx, ddy)
+                        heapq.heappush(open_heap, (ng + h * 1.18, nxt))
+
+            path = []
+            curr = best_node
+            while curr != -1 and curr in came_from:
+                path.append(curr)
+                curr = came_from[curr]
+            path.reverse()
+
+            self._cache_s = s
+            self._cache_g = g
+            self._cache_t = now_t
+            self._cache_path = path
+
+        if len(path) <= 1:
+            return dx / d, dy / d, False
+
+        target_cell = path[1]
+        for idx in range(min(4, len(path) - 1), 1, -1):
+            wx, wy = self.cell_to_world(path[idx])
+            if self.line_walkable(start_pos[0], start_pos[1], wx, wy):
+                target_cell = path[idx]
+                break
+
+        wx, wy = self.cell_to_world(target_cell)
+        wdx, wdy = wx - start_pos[0], wy - start_pos[1]
+        wd = math.hypot(wdx, wdy)
+        if wd <= 1e-4:
+            return dx / d, dy / d, False
+        ux, uy = wdx / wd, wdy / wd
+        step_up = (self.ground_z(start_pos[0] + ux * 3.0, start_pos[1] + uy * 3.0) - start_pos[2]) > 1.05
+        return ux, uy, step_up
+
+    def has_los(self, p1, p2):
+        if not self.prisms and not self.terrain:
+            return True
+        dx, dy, dz = p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist < 4.0:
+            return True
+        steps = min(32, max(4, int(dist / 5.5)))
+        min_x, max_x = min(p1[0], p2[0]), max(p1[0], p2[0])
+        min_y, max_y = min(p1[1], p2[1]), max(p1[1], p2[1])
+        min_z, max_z = min(p1[2], p2[2]), max(p1[2], p2[2])
+
+        cand = [
+            p for p in self.prisms
+            if p["max_x"] >= min_x and p["min_x"] <= max_x
+            and p["max_y"] >= min_y and p["min_y"] <= max_y
+            and p["top"] >= min_z and p["base"] <= max_z
+        ]
+
+        for i in range(1, steps):
+            t = i / steps
+            x = p1[0] + dx * t
+            y = p1[1] + dy * t
+            z = p1[2] + dz * t
+            if self.terrain and z < self.ground_z(x, y) - 0.2:
+                return False
+            for p in cand:
+                if self._point_in_prism(x, y, z, p):
+                    return False
+        return True
+
+    def mortar_arc_clear(self, muzzle, target, speed, pitch, yaw, g=22.0):
+        if not self.prisms:
+            return True
+        cp = math.cos(pitch)
+        vx = speed * cp * math.cos(yaw)
+        vy = speed * cp * math.sin(yaw)
+        vz = speed * math.sin(pitch)
+        horiz = math.hypot(target[0] - muzzle[0], target[1] - muzzle[1])
+        t_total = horiz / max(speed * cp, 1.0)
+        if t_total <= 0.1 or t_total > 6.5:
+            return False
+        for i in range(1, 10):
+            t = (i / 10.0) * t_total
+            x = muzzle[0] + vx * t
+            y = muzzle[1] + vy * t
+            z = muzzle[2] + vz * t - 0.5 * g * t * t
+            if self.terrain and z < self.ground_z(x, y):
+                return False
+            for p in self.prisms:
+                if self._point_in_prism(x, y, z, p):
+                    return False
+        return True
+
+    def canopy_cover_bonus(self, x, y):
+        bx, by = int(math.floor(x / 32.0)), int(math.floor(y / 32.0))
+        bonus = 0.0
+        for tx, ty, cr in self.tree_buckets.get((bx, by), ()):
+            if abs(tx - x) <= cr and abs(ty - y) <= cr:
+                if math.hypot(tx - x, ty - y) <= cr:
+                    bonus += 18.0
+                    if bonus >= 36.0:
+                        break
+        return bonus
 
 
-def encode(obj: Dict[str, Any]) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+class ValkyrieSovereign:
+    UPGRADE_SCORES = {
+        "nanites": 100,
+        "armor": 96,
+        "plating": 92,
+        "servos": 88,
+        "gyros": 84,
+        "jets": 80,
+        "reactor": 76,
+        "capacitor": 72,
+        "sensors": 68,
+        "laser_charge": 88,
+        "laser_damage": 84,
+        "laser_pierce": 70,
+        "lightning_efficiency": 87,
+        "lightning_range": 85,
+        "lightning_chain": 76,
+        "mortar_reload": 85,
+        "mortar_splash": 81,
+        "mortar_velocity": 79,
+        "gun_damage": 74,
+        "gun_rate": 73,
+        "gun_velocity": 71,
+        "gun_mag": 66,
+    }
+
+    WEAPON_PRIORITY = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
+    SOUND_DIST_MAP = {"near": 38.0, "mid": 105.0, "far": 210.0}
+
+    def __init__(self, hello):
+        self.cfg = hello.get("config", {})
+        self.map = NavMap(hello.get("map", {}), self.cfg)
+        self.tick = 0
+        self.t = 0.0
+        self.alive = 16
+        self.me = {}
+        self.zone = {}
+        self.enemies = {}
+        self.npcs = {}
+        self.pickups = []
+        self.cubes = []
+        self.crates = []
+        self.drops = []
+        self.projectiles = []
+        self.sounds = []
+        self.beams = []
+        self.events = []
+        self.offer = None
+
+        self.last_pos = None
+        self.stuck_ticks = 0
+        self.strafe_sign = 1.0
+        self.last_damage_t = -99.0
+        self.last_hit_t = -99.0
+        self.cover_spot = None
+        self.cover_spot_t = -99.0
+        self.sound_threats = []
+        self.last_sound_yaw = None
+        self.last_sound_t = -99.0
+
+    def update(self, obs):
+        self.tick = obs.get("tick", 0)
+        self.t = obs.get("t", 0.0)
+        self.alive = obs.get("alive", 16)
+        self.me = obs.get("self", {})
+        self.zone = obs.get("zone", {})
+        self.offer = obs.get("offer")
+        self.pickups = obs.get("pickups", [])
+        self.cubes = obs.get("cubes", [])
+        self.crates = obs.get("crates", [])
+        self.drops = obs.get("drops", [])
+        self.projectiles = obs.get("projectiles", [])
+        self.sounds = obs.get("sounds", [])
+        self.beams = obs.get("beams", [])
+        self.events = obs.get("events", [])
+
+        pos = self.me.get("pos")
+
+        for ev in self.events:
+            et = ev.get("type")
+            if et == "damaged":
+                self.last_damage_t = self.t
+                if ev.get("bearing") is not None and pos:
+                    b = ev["bearing"]
+                    self.last_sound_yaw = b
+                    self.last_sound_t = self.t
+                    self.sound_threats.append((pos[0] + math.cos(b) * 45.0, pos[1] + math.sin(b) * 45.0, 55.0, 3.5, self.t + 4.0))
+            elif et == "hit":
+                self.last_hit_t = self.t
+
+        for bm in self.beams:
+            by_id = bm.get("by")
+            path = bm.get("path", [])
+            if by_id is not None and by_id != self.me.get("id") and path:
+                mp = path[0]
+                if by_id not in self.enemies:
+                    self.enemies[by_id] = {
+                        "id": by_id,
+                        "kind": "mech",
+                        "pos": [mp[0], mp[1], max(0.0, mp[2] - 7.0)],
+                        "vel": [0.0, 0.0, 0.0],
+                        "aim": [0.0, 0.0],
+                        "hp": 1000,
+                        "weapons": [bm.get("kind", "laser")],
+                        "seen_t": self.t,
+                    }
+
+        if pos:
+            for snd in self.sounds:
+                sk = snd.get("kind", "")
+                if sk in ("npc_gun", "crate", "drop"):
+                    continue
+                b = snd.get("bearing")
+                if b is None:
+                    continue
+                d_est = self.SOUND_DIST_MAP.get(snd.get("dist", "mid"), 105.0)
+                sx = pos[0] + math.cos(b) * d_est
+                sy = pos[1] + math.sin(b) * d_est
+                if sk in ("laser", "laser_charge", "mortar", "explosion", "lightning", "gun"):
+                    self.sound_threats.append((sx, sy, 55.0, 2.5, self.t + 3.5))
+                if snd.get("dist") in ("near", "mid"):
+                    self.last_sound_yaw = b
+                    self.last_sound_t = self.t
+
+        self.sound_threats = [st for st in self.sound_threats if st[4] > self.t]
+        if len(self.sound_threats) > 10:
+            self.sound_threats = self.sound_threats[-10:]
+
+        if pos and self.last_pos:
+            if math.hypot(pos[0] - self.last_pos[0], pos[1] - self.last_pos[1]) < 0.25:
+                self.stuck_ticks += 1
+            else:
+                self.stuck_ticks = 0
+        if pos:
+            self.last_pos = list(pos)
+
+        if self.tick % 20 == 0:
+            self.strafe_sign *= -1.0
+
+        for m in obs.get("mechs", []):
+            mid = m.get("id")
+            if mid is None:
+                continue
+            m["seen_t"] = self.t
+            if m.get("kind") == "mech":
+                self.enemies[mid] = m
+            elif m.get("kind") == "npc":
+                self.npcs[mid] = m
+
+        self.enemies = {k: v for k, v in self.enemies.items() if self.t - v.get("seen_t", 0) <= 4.8}
+        self.npcs = {k: v for k, v in self.npcs.items() if self.t - v.get("seen_t", 0) <= 3.0}
+
+    @staticmethod
+    def d2(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def pick_upgrade(self, offer):
+        choices = offer.get("choices", [])
+        best_i, best_s = 0, -1
+        for i, c in enumerate(choices):
+            cid = c.get("id", "").lower()
+            s = self.UPGRADE_SCORES.get(cid, 50)
+            if s > best_s:
+                best_s, best_i = s, i
+        return best_i
+
+    def live_zone(self):
+        z = self.zone
+        c0 = z.get("center", [0.0, 0.0])
+        r0 = z.get("radius", 560.0)
+        c1 = z.get("next_center", c0)
+        r1 = z.get("next_radius", r0)
+        ts = z.get("shrink_start", 60.0)
+        te = z.get("shrink_end", 110.0)
+        if self.t <= ts or te <= ts:
+            alpha = 0.0
+        elif self.t >= te:
+            alpha = 1.0
+        else:
+            alpha = (self.t - ts) / (te - ts)
+        cx = c0[0] + (c1[0] - c0[0]) * alpha
+        cy = c0[1] + (c1[1] - c0[1]) * alpha
+        cr = r0 + (r1 - r0) * alpha
+        return (cx, cy), cr, (c1[0], c1[1]), r1, ts, te
+
+    def aim_at(self, tpos, tvel, z_offset, wk, ws):
+        pos = self.me["pos"]
+        mh = self.me.get("stats", {}).get("muzzle_height", 7.0) + (2.5 if wk == "mortar" else 0.0)
+        mx, my, mz = pos[0], pos[1], pos[2] + mh
+        tx, ty, tz = tpos[0], tpos[1], tpos[2] + z_offset
+        dx, dy, dz = tx - mx, ty - my, tz - mz
+        dist = max(math.hypot(dx, dy), 0.1)
+
+        if wk == "gun":
+            spd = max(ws.get("speed", 252.0), 1.0)
+            tf = dist / spd
+            for _ in range(2):
+                px = tx + tvel[0] * tf - mx
+                py = ty + tvel[1] * tf - my
+                pz = tz + tvel[2] * tf - mz
+                tf = math.sqrt(px * px + py * py + pz * pz) / spd
+            return math.atan2(py, px), math.atan2(pz, max(math.hypot(px, py), 0.1))
+
+        if wk == "mortar":
+            spd = max(ws.get("speed", 72.0), 1.0)
+            g = ws.get("gravity", 22.0)
+            tf = dist / (spd * 0.82)
+            pitch = 0.7854
+            px, py = dx, dy
+            for _ in range(2):
+                px = tx + tvel[0] * tf - mx
+                py = ty + tvel[1] * tf - my
+                pz = tz + tvel[2] * tf - mz
+                r = max(math.hypot(px, py), 0.1)
+                v2 = spd * spd
+                disc = v2 * v2 - g * (g * r * r + 2.0 * pz * v2)
+                if disc >= 0:
+                    pitch = math.atan((v2 - math.sqrt(disc)) / (g * r))
+                    tf = r / max(spd * math.cos(pitch), 1.0)
+                else:
+                    pitch = 0.7854
+                    break
+            return math.atan2(py, px), pitch
+
+        return math.atan2(dy, dx), math.atan2(dz, dist)
+
+    def find_cover_spot(self, pos, zc, zr, threats):
+        if self.cover_spot and (self.t - self.cover_spot_t < 2.2) and self.d2(self.cover_spot, zc) < zr * 0.9:
+            return self.cover_spot
+        if not self.map.walkable or not threats:
+            return None
+
+        best_xy = None
+        best_score = -1e9
+        for ang_deg in range(0, 360, 30):
+            rad = math.radians(ang_deg)
+            for rad_dist in (18.0, 34.0):
+                cx = pos[0] + math.cos(rad) * rad_dist
+                cy = pos[1] + math.sin(rad) * rad_dist
+                if self.d2((cx, cy), zc) > zr * 0.86:
+                    continue
+                if not self.map.walkable[self.map.world_to_cell(cx, cy)]:
+                    continue
+                cz = self.map.ground_z(cx, cy) + 6.5
+                hidden = True
+                min_td = 999.0
+                for e in threats:
+                    ep = e["pos"]
+                    td = self.d2((cx, cy), ep)
+                    if td < min_td:
+                        min_td = td
+                    if self.map.has_los([ep[0], ep[1], ep[2] + 8.0], [cx, cy, cz]):
+                        hidden = False
+                        break
+                foliage = self.map.canopy_cover_bonus(cx, cy)
+                sc = (140.0 if hidden else 0.0) + foliage + min(min_td, 130.0) - self.d2((cx, cy), zc) * 0.25
+                if sc > best_score:
+                    best_score = sc
+                    best_xy = (cx, cy)
+
+        if best_xy:
+            self.cover_spot = best_xy
+            self.cover_spot_t = self.t
+        return best_xy
+
+    def score_target(self, e, pos, held):
+        ep = e["pos"]
+        ed = self.d2(pos, ep)
+        hp = e.get("hp", 1000)
+        e_weaps = set(e.get("weapons", []))
+        e_aim = e.get("aim", [0.0, 0.0])[0]
+
+        score = 210.0 - ed
+        if hp < 340:
+            score += 125.0
+        elif hp < 650:
+            score += 45.0
+
+        if "laser" in held and "mortar" in e_weaps:
+            score += 75.0
+        if "lightning" in held and "laser" in e_weaps:
+            score += 70.0
+            if e.get("charging"):
+                score += 60.0
+        if "mortar" in held and "lightning" in e_weaps:
+            score += 60.0
+
+        to_me = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
+        ang_diff = abs((to_me - e_aim + math.pi) % (2 * math.pi) - math.pi)
+        if ang_diff > math.pi * 0.55:
+            score += 50.0
+
+        return score
+
+    def step(self):
+        act = {
+            "tick": self.tick,
+            "move": [0.0, 0.0],
+            "boost": False,
+            "jump": False,
+            "fire": [False, False],
+            "reload": False,
+        }
+
+        try:
+            me = self.me
+            pos = me.get("pos")
+            if not pos:
+                return act
+
+            hp = me.get("hp", 1400)
+            max_hp = me.get("max_hp", 1400)
+            hp_ratio = hp / max(max_hp, 1)
+            energy = me.get("energy", 100)
+            grounded = me.get("grounded", True)
+            in_zone = me.get("in_zone", True)
+            cubes_cnt = me.get("cubes", 0)
+            stats = me.get("stats", {})
+            walk_spd = max(stats.get("walk_speed", 11.7), 5.0)
+            weapons = list(me.get("weapons", [None, None]))
+            while len(weapons) < 2:
+                weapons.append(None)
+
+            if self.offer:
+                act["pick"] = self.pick_upgrade(self.offer)
+
+            held = [w["kind"] for w in weapons if w]
+            empty = [i for i, w in enumerate(weapons) if w is None]
+            laser_charging = any(w and w.get("kind") == "laser" and w.get("charge", 0.0) > 0.0 for w in weapons)
+
+            # 1. Perception: Muzzle LOS + Indirect Mortar Candidates
+            muzzle_h = stats.get("muzzle_height", 7.0)
+            muzzle = [pos[0], pos[1], pos[2] + muzzle_h]
+
+            vis_enemies = []
+            mortar_enemies = []
+            nearest_any = None
+            nearest_any_d = 9999.0
+
+            for e in self.enemies.values():
+                d = self.d2(pos, e["pos"])
+                if d < nearest_any_d:
+                    nearest_any_d = d
+                    nearest_any = e
+                t_center = [e["pos"][0], e["pos"][1], e["pos"][2] + 4.8]
+                if d <= 215.0 and self.map.has_los(muzzle, t_center):
+                    vis_enemies.append(e)
+                elif "mortar" in held and 28.0 <= d <= 195.0:
+                    mortar_enemies.append(e)
+
+            # 2. Weapon Loot & Smart Loadout Upgrade
+            near_pickup = None
+            best_p_prio = 0
+            safe_to_swap = (not vis_enemies) or (nearest_any_d > 32.0)
+            for p in self.pickups:
+                pk = p.get("kind")
+                if pk in held:
+                    continue
+                d = self.d2(pos, p["pos"])
+                dz = abs(pos[2] - p["pos"][2])
+                p_prio = self.WEAPON_PRIORITY.get(pk, 1)
+                if d <= 3.85 and dz <= 3.85 and not laser_charging and safe_to_swap:
+                    if empty:
+                        act["take"] = p["id"]
+                        break
+                    worst_idx = min((0, 1), key=lambda i: self.WEAPON_PRIORITY.get(weapons[i]["kind"], 0))
+                    if p_prio > self.WEAPON_PRIORITY.get(weapons[worst_idx]["kind"], 0):
+                        act["take"] = p["id"]
+                        act["drop"] = worst_idx
+                        break
+                elif empty and d < 36.0 and dz <= 4.5 and p_prio > best_p_prio:
+                    best_p_prio = p_prio
+                    near_pickup = p
+
+            # 3. Live Zone Pacing & Quiet-Sector Anchor
+            cur_zc, cur_zr, next_zc, next_zr, shrink_s, shrink_e = self.live_zone()
+            dist_cur_zc = self.d2(pos, cur_zc)
+            dist_next_zc = self.d2(pos, next_zc)
+            dist_to_next_edge = max(0.0, dist_next_zc - next_zr * 0.85)
+            travel_time_needed = dist_to_next_edge / walk_spd
+            time_until_closed = max(0.0, shrink_e - self.t)
+
+            zone_urgent = (
+                (not in_zone)
+                or (dist_cur_zc > cur_zr - 12.0)
+                or (dist_to_next_edge > 0.0 and time_until_closed <= travel_time_needed + 7.5)
+            )
+            healing_mode = (hp_ratio < 0.75) and (self.t > 10.0)
+
+            anchor_x, anchor_y = next_zc[0], next_zc[1]
+            if next_zr > 35.0:
+                rep_x, rep_y = 0.0, 0.0
+                for e in self.enemies.values():
+                    dx_e = pos[0] - e["pos"][0]
+                    dy_e = pos[1] - e["pos"][1]
+                    de = max(math.hypot(dx_e, dy_e), 1.0)
+                    if de < 180.0:
+                        w = (180.0 - de) / 180.0
+                        rep_x += (dx_e / de) * w * 1.5
+                        rep_y += (dy_e / de) * w * 1.5
+                for sx, sy, _, sw, _ in self.sound_threats:
+                    dx_s = pos[0] - sx
+                    dy_s = pos[1] - sy
+                    ds = max(math.hypot(dx_s, dy_s), 1.0)
+                    if ds < 200.0:
+                        w = (200.0 - ds) / 200.0
+                        rep_x += (dx_s / ds) * w
+                        rep_y += (dy_s / ds) * w
+                rmag = math.hypot(rep_x, rep_y)
+                if rmag > 0.05:
+                    off = min(next_zr * 0.50, 72.0)
+                    anchor_x = next_zc[0] + (rep_x / rmag) * off
+                    anchor_y = next_zc[1] + (rep_y / rmag) * off
+
+            best_drop = None
+            if not zone_urgent:
+                for dr in self.drops:
+                    if dr.get("lands_in", 99) <= 14.0 and (
+                        dr.get("holder") in (None, me.get("id")) or self.d2(pos, dr["pos"]) < 14.0
+                    ):
+                        dd = self.d2(pos, dr["pos"])
+                        if dd < 90.0 and (not nearest_any or nearest_any_d > 36.0 or hp_ratio < 0.65):
+                            best_drop = dr
+                            break
+
+            # 4. Target Selection
+            target = None
+            target_z_off = 4.8
+            is_crate = False
+            indirect_mortar = False
+
+            if vis_enemies:
+                best_e = max(vis_enemies, key=lambda e: self.score_target(e, pos, held))
+                ed = self.d2(pos, best_e["pos"])
+                if not healing_mode or ed < 75.0 or best_e.get("hp", 999) < 280 or laser_charging:
+                    target = best_e
+            elif mortar_enemies and not healing_mode and not zone_urgent:
+                target = max(mortar_enemies, key=lambda e: self.score_target(e, pos, held))
+                indirect_mortar = True
+            elif not healing_mode and cubes_cnt < 10 and (not nearest_any or nearest_any_d > 80.0):
+                for n in sorted(self.npcs.values(), key=lambda x: self.d2(pos, x["pos"])):
+                    nd = self.d2(pos, n["pos"])
+                    if nd < 65.0 and self.map.has_los(muzzle, [n["pos"][0], n["pos"][1], n["pos"][2] + 2.0]):
+                        target, target_z_off = n, 1.8
+                        break
+                if not target:
+                    for c in sorted(self.crates, key=lambda x: self.d2(pos, x["pos"])):
+                        cd = self.d2(pos, c["pos"])
+                        if cd < 35.0 and self.map.has_los(muzzle, [c["pos"][0], c["pos"][1], c["pos"][2] + 1.5]):
+                            target, target_z_off, is_crate = c, 1.5, True
+                            break
+
+            # 5. Movement & Stealth Pacing
+            use_astar = False
+            stealth_hold = False
+            silent_walk = False
+            gx, gy = anchor_x, anchor_y
+
+            if zone_urgent:
+                gx, gy = next_zc[0], next_zc[1]
+                use_astar = True
+                if energy > 25 and dist_to_next_edge > 14.0:
+                    act["boost"] = True
+            elif healing_mode and (vis_enemies or (nearest_any and nearest_any_d < 95.0)):
+                cov = self.find_cover_spot(pos, next_zc, next_zr, list(self.enemies.values()))
+                if cov:
+                    gx, gy = cov
+                    use_astar = True
+                    cd_cov = self.d2(pos, cov)
+                    if cd_cov < 4.5 and not vis_enemies:
+                        stealth_hold = True
+                    elif not vis_enemies and nearest_any_d < 45.0:
+                        silent_walk = True
+                else:
+                    gx, gy = anchor_x, anchor_y
+                    use_astar = True
+                if not stealth_hold and not silent_walk and energy > 30 and vis_enemies:
+                    act["boost"] = True
+            elif best_drop:
+                dpos = best_drop["pos"]
+                dd = self.d2(pos, dpos)
+                if dd < 6.0 and best_drop.get("lands_in", 0) <= 0.5:
+                    ang = self.t * 2.2
+                    gx = dpos[0] + math.cos(ang) * 3.5
+                    gy = dpos[1] + math.sin(ang) * 3.5
+                else:
+                    gx, gy = dpos[0], dpos[1]
+                    use_astar = True
+                    if energy > 45 and dd > 12.0:
+                        act["boost"] = True
+            elif any(abs(c["pos"][2] - pos[2]) <= 4.5 for c in self.cubes):
+                nc = min(
+                    (c for c in self.cubes if abs(c["pos"][2] - pos[2]) <= 4.5),
+                    key=lambda c: self.d2(pos, c["pos"]),
+                )
+                if self.d2(pos, nc["pos"]) < 34.0 and (not nearest_any or nearest_any_d > 42.0):
+                    gx, gy = nc["pos"][0], nc["pos"][1]
+                    use_astar = True
+            elif near_pickup and (not nearest_any or nearest_any_d > 42.0):
+                gx, gy = near_pickup["pos"][0], near_pickup["pos"][1]
+                use_astar = True
+            elif vis_enemies and target and target.get("kind") == "mech":
+                epos = target["pos"]
+                ed = self.d2(pos, epos)
+                ux = (epos[0] - pos[0]) / max(ed, 0.1)
+                uy = (epos[1] - pos[1]) / max(ed, 0.1)
+                px, py = -uy * self.strafe_sign, ux * self.strafe_sign
+
+                ideal = 24.0 if "lightning" in held else (68.0 if "laser" in held else 48.0)
+                if ed < ideal - 8.0:
+                    gx, gy = pos[0] - ux * 16.0 + px * 18.0, pos[1] - uy * 16.0 + py * 18.0
+                elif ed > ideal + 14.0 and (self.alive <= 6 or target.get("hp", 999) < 340):
+                    gx, gy = pos[0] + ux * 15.0 + px * 15.0, pos[1] + uy * 15.0 + py * 15.0
+                else:
+                    gx, gy = pos[0] + px * 20.0, pos[1] + py * 20.0
+            else:
+                if self.d2(pos, (anchor_x, anchor_y)) > 16.0:
+                    gx, gy = anchor_x, anchor_y
+                    use_astar = True
+                    if nearest_any and nearest_any_d < 45.0:
+                        silent_walk = True
+                else:
+                    stealth_hold = True
+
+            # Projectile & Enemy Laser-Charge Dodge Override
+            dx_dodge, dy_dodge = 0.0, 0.0
+            for pr in self.projectiles:
+                pp, pv = pr["pos"], pr["vel"]
+                rx, ry = pos[0] - pp[0], pos[1] - pp[1]
+                pd = math.hypot(rx, ry)
+                ps = math.hypot(pv[0], pv[1])
+                if pd < 32.0 and ps > 1.0:
+                    vx, vy = pv[0] / ps, pv[1] / ps
+                    if rx * vx + ry * vy > 0:
+                        px, py = -vy, vx
+                        side = 1.0 if (rx * px + ry * py) >= 0 else -1.0
+                        dx_dodge += px * side * 28.0
+                        dy_dodge += py * side * 28.0
+                        stealth_hold = False
+                        silent_walk = False
+                        if energy > 20 and pd < 18.0:
+                            act["boost"] = True
+
+            for e in vis_enemies:
+                if e.get("charging"):
+                    ep = e["pos"]
+                    e_yaw = e.get("aim", [0.0, 0.0])[0]
+                    to_us = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
+                    if abs((to_us - e_yaw + math.pi) % (2 * math.pi) - math.pi) < 0.34:
+                        rx, ry = pos[0] - ep[0], pos[1] - ep[1]
+                        rd = max(math.hypot(rx, ry), 0.1)
+                        px, py = -ry / rd, rx / rd
+                        dx_dodge += px * self.strafe_sign * 34.0
+                        dy_dodge += py * self.strafe_sign * 34.0
+                        stealth_hold = False
+                        silent_walk = False
+                        if energy > 20:
+                            act["boost"] = True
+
+            if stealth_hold:
+                act["move"] = [0.0, 0.0]
+            else:
+                step_up_jump = False
+                if use_astar:
+                    d_grid = None
+                    if healing_mode or zone_urgent:
+                        path_threats = [(e["pos"][0], e["pos"][1], 45.0, 3.0) for e in self.enemies.values()]
+                        for sx, sy, sr, sw, _ in self.sound_threats:
+                            path_threats.append((sx, sy, sr, sw * 0.7))
+                        d_grid = self.map.build_danger_grid(path_threats)
+                    sx, sy, step_up_jump = self.map.find_path_dir(pos, (gx, gy), d_grid, self.t)
+                    rx, ry = sx * 20.0 + dx_dodge, sy * 20.0 + dy_dodge
+                    rm = math.hypot(rx, ry)
+                    mx, my = (rx / rm, ry / rm) if rm > 1e-4 else (sx, sy)
+                else:
+                    rx = (gx - pos[0]) + dx_dodge
+                    ry = (gy - pos[1]) + dy_dodge
+                    rm = math.hypot(rx, ry)
+                    mx, my = (rx / rm, ry / rm) if rm > 1e-4 else (0.0, 0.0)
+                    if self.map.walkable and not self.map.walkable[self.map.world_to_cell(pos[0] + mx * 6.0, pos[1] + my * 6.0)]:
+                        mx, my = -mx, -my
+
+                if silent_walk and not act["boost"]:
+                    scale = min(0.40, 4.6 / walk_spd)
+                    mx *= scale
+                    my *= scale
+
+                act["move"] = [round(mx, 4), round(my, 4)]
+
+                if ((step_up_jump and energy > 25) or (self.stuck_ticks >= 4 and energy > 20)):
+                    if grounded:
+                        act["jump"] = True
+                    else:
+                        act["boost"] = True
+
+            # 6. Per-Weapon Independent Aiming & Firing
+            if target:
+                tpos = target["pos"]
+                tvel = target.get("vel", [0.0, 0.0, 0.0])
+                tdist = self.d2(pos, tpos)
+                cur_aim = me.get("aim", [0.0, 0.0])
+                t_weaps = set(target.get("weapons", []))
+
+                slot_aims = [None, None]
+                slot_ready = [False, False]
+
+                for idx in (0, 1):
+                    w = weapons[idx]
+                    if not w:
+                        continue
+                    wk = w.get("kind", "gun")
+                    ws = w.get("stats", {})
+                    cd = w.get("cooldown", 0.0)
+                    ch = w.get("charge", 0.0)
+
+                    if wk == "gun":
+                        ammo = w.get("ammo", 12)
+                        if ammo == 0 or (ammo <= 3 and tdist > 85.0 and w.get("reload", 0) == 0):
+                            act["reload"] = True
+
+                    if indirect_mortar and wk != "mortar":
+                        continue
+
+                    z_off = 0.8 if wk == "mortar" else target_z_off
+                    ay, ap = self.aim_at(tpos, tvel, z_off, wk, ws)
+                    slot_aims[idx] = (ay, ap)
+
+                    if wk == "laser":
+                        lightning_threat = ("lightning" in t_weaps and tdist < 52.0 and ch == 0.0)
+                        if ch > 0.0:
+                            slot_ready[idx] = True
+                        else:
+                            slot_ready[idx] = (
+                                cd <= 0.2
+                                and not indirect_mortar
+                                and not lightning_threat
+                                and tdist <= ws.get("range", 280.0)
+                                and not zone_urgent
+                                and not healing_mode
+                            )
+                    elif wk == "lightning":
+                        slot_ready[idx] = (
+                            cd <= 0.15
+                            and not indirect_mortar
+                            and tdist <= ws.get("range", 45.0) - 1.5
+                            and energy > 12
+                        )
+                    elif wk == "mortar":
+                        can_mortar = cd <= 0.2 and 18.0 <= tdist <= 220.0 and not is_crate
+                        if can_mortar and indirect_mortar:
+                            can_mortar = self.map.mortar_arc_clear(
+                                [pos[0], pos[1], pos[2] + muzzle_h + 2.5],
+                                tpos,
+                                ws.get("speed", 72.0),
+                                ap,
+                                ay,
+                                ws.get("gravity", 22.0),
+                            )
+                        slot_ready[idx] = can_mortar
+                    else:
+                        slot_ready[idx] = (
+                            cd <= 0.2
+                            and not indirect_mortar
+                            and w.get("reload", 0) <= 0
+                            and tdist <= ws.get("range", 230.0)
+                        )
+
+                chosen_slot = None
+                best_p = -1
+                for idx in (0, 1):
+                    if slot_ready[idx] and weapons[idx]:
+                        p = self.WEAPON_PRIORITY.get(weapons[idx].get("kind", "gun"), 0)
+                        if weapons[idx].get("kind") == "laser" and weapons[idx].get("charge", 0) > 0:
+                            p += 5
+                        if p > best_p:
+                            best_p = p
+                            chosen_slot = idx
+                if chosen_slot is None:
+                    for idx in (0, 1):
+                        if slot_aims[idx] is not None:
+                            chosen_slot = idx
+                            break
+
+                if chosen_slot is not None:
+                    des_y, des_p = slot_aims[chosen_slot]
+                    act["aim"] = [round(des_y, 4), round(des_p, 4)]
+
+                    for idx in (0, 1):
+                        if not slot_ready[idx] or slot_aims[idx] is None:
+                            continue
+                        sy, sp = slot_aims[idx]
+                        yerr = abs((sy - cur_aim[0] + math.pi) % (2 * math.pi) - math.pi)
+                        perr = abs(sp - cur_aim[1])
+                        wk = weapons[idx].get("kind", "gun")
+                        ws = weapons[idx].get("stats", {})
+
+                        if wk == "laser":
+                            ch = weapons[idx].get("charge", 0.0)
+                            max_c = ws.get("charge", 0.75)
+                            min_c = ws.get("min_charge", 0.15)
+                            abort_release = (zone_urgent or healing_mode) and ch >= min_c and yerr < 0.14
+                            ready_release = (
+                                abort_release
+                                or (ch >= max_c * 0.88 and yerr < 0.11 and perr < 0.11)
+                                or (ch >= max_c * 0.96 and yerr < 0.20)
+                                or (ch >= min_c and target.get("hp", 999) < 120 and yerr < 0.11 and perr < 0.11)
+                            )
+                            act["fire"][idx] = not ready_release
+                        elif wk == "lightning":
+                            if yerr < 0.24 and perr < 0.30:
+                                act["fire"][idx] = True
+                        elif wk == "mortar":
+                            if yerr < 0.14 and perr < 0.10:
+                                act["fire"][idx] = True
+                        else:
+                            if yerr < 0.16 and perr < 0.14:
+                                act["fire"][idx] = True
+            else:
+                for idx in (0, 1):
+                    w = weapons[idx]
+                    if w and w.get("kind") == "laser" and w.get("charge", 0) > 0:
+                        act["fire"][idx] = False
+
+                scan = None
+                for ev in self.events:
+                    if ev.get("type") == "damaged" and ev.get("bearing") is not None:
+                        scan = ev["bearing"]
+                        break
+                if scan is None and nearest_any:
+                    scan = math.atan2(nearest_any["pos"][1] - pos[1], nearest_any["pos"][0] - pos[0])
+                if scan is None and self.last_sound_yaw is not None and (self.t - self.last_sound_t) < 2.5:
+                    scan = self.last_sound_yaw
+                if scan is None:
+                    scan = (self.t * 1.45) % (2 * math.pi) - math.pi
+                act["aim"] = [round(scan, 4), 0.0]
+
+            return act
+        except Exception:
+            return {"tick": self.tick, "move": [0.0, 0.0], "fire": [False, False]}
 
 
-def main() -> None:
-    bot = MechSurvivor()
-    fd = sys.stdin.fileno()
-    try:
-        os.set_blocking(fd, False)
-    except (AttributeError, OSError):
-        pass
-    buffer = bytearray()
-    eof = False
-
+def main():
+    bot = None
+    stdin = sys.stdin.buffer
     while True:
-        if b"\n" not in buffer and not eof:
-            ready, _, _ = select.select([fd], [], [])
-            if not ready:
-                continue
-        # Read all immediately available bytes so we can collapse a backlog to the newest obs.
-        while True:
-            try:
-                chunk = os.read(fd, 65536)
-            except BlockingIOError:
+        raw = stdin.readline()
+        if not raw:
+            break
+        batch = [raw]
+        while select.select([stdin], [], [], 0.0)[0]:
+            nxt = stdin.readline()
+            if not nxt:
                 break
-            except OSError:
-                eof = True
-                break
-            if not chunk:
-                eof = True
-                break
-            buffer.extend(chunk)
-            if len(chunk) < 65536:
-                # One more nonblocking read below catches any bytes already queued.
-                continue
-        messages: List[Dict[str, Any]] = []
-        while True:
-            nl = buffer.find(b"\n")
-            if nl < 0:
-                break
-            raw = bytes(buffer[:nl])
-            del buffer[:nl+1]
-            if not raw:
-                continue
-            try:
-                value = json.loads(raw)
-                if isinstance(value, dict):
-                    messages.append(value)
-            except (ValueError, UnicodeDecodeError):
-                continue
-        if eof and buffer:
-            try:
-                value = json.loads(bytes(buffer))
-                if isinstance(value, dict):
-                    messages.append(value)
-            except (ValueError, UnicodeDecodeError):
-                pass
-            buffer.clear()
+            batch.append(nxt)
 
-        # Handle control messages in order; for a burst of observations, answer only the newest.
-        obs_batch: List[Dict[str, Any]] = []
-        should_exit = False
-        for msg in messages:
-            typ = msg.get("type")
-            if typ == "hello":
-                try:
-                    print(encode(bot.on_hello(msg)), flush=True)
-                except Exception as exc:
-                    print("hello error: " + repr(exc), file=sys.stderr, flush=True)
-                    print(encode({"type": "ready", "name": "MechSurvivor-Pro"}), flush=True)
-            elif typ == "obs":
-                obs_batch.append(msg)
-            elif typ == "end":
-                should_exit = True
-
-        if obs_batch:
-            observation = obs_batch[-1]
+        latest_obs = None
+        ended = False
+        for line in batch:
+            s = line.strip()
+            if not s:
+                continue
             try:
-                answer = bot.decide(observation)
-            except Exception as exc:
-                print("decision error: " + repr(exc), file=sys.stderr, flush=True)
-                me = observation.get("self", {}) or {}
-                actual = me.get("aim", [0.0, 0.0])
-                answer = {"tick": int(observation.get("tick", 0)), "move": [0.0, 0.0],
-                          "boost": False, "jump": False, "aim": actual,
-                          "fire": [False, False], "reload": False}
-            try:
-                print(encode(answer), flush=True)
-            except (TypeError, ValueError):
-                fallback = {"tick": int(observation.get("tick", 0)), "move": [0.0, 0.0],
-                            "aim": [0.0, 0.0], "fire": [False, False]}
-                print(encode(fallback), flush=True)
+                msg = json.loads(s)
+            except Exception:
+                continue
+            t = msg.get("type")
+            if t == "hello":
+                bot = ValkyrieSovereign(msg)
+                print(json.dumps({"type": "ready", "name": "ValkyrieSovereign"}), flush=True)
+            elif t == "obs":
+                latest_obs = msg
+            elif t == "end":
+                ended = True
 
-        if should_exit or eof:
+        if latest_obs is not None and bot is not None:
+            bot.update(latest_obs)
+            print(json.dumps(bot.step()), flush=True)
+
+        if ended:
             break
 
 
