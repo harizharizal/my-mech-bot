@@ -1,8 +1,4 @@
-
 FROM python:3.13-slim
-
 WORKDIR /bot
-
-COPY . .
-
-ENTRYPOINT ["python3", "-u", "/bot/example_bot.py"]
+COPY mech_survivor.py /bot/mech_survivor.py
+ENTRYPOINT ["python3", "-u", "/bot/mech_survivor.py"]
