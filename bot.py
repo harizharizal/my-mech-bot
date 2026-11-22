@@ -4,7 +4,7 @@ import json
 import math
 import struct
 import select
-from collections import deque
+import heapq
 
 
 class NavMap:
@@ -16,11 +16,11 @@ class NavMap:
         self.min_y = 0.0
         self.step = 1.0
         self.prisms = []
-        self.gs = 8.0
-        self.gx_min = -80
-        self.gy_min = -60
-        self.gw = 160
-        self.gh = 120
+        self.gs = 6.0
+        self.gx_min = -100
+        self.gy_min = -80
+        self.gw = 200
+        self.gh = 160
         self.walkable = None
         self.adj = None
 
@@ -86,8 +86,10 @@ class NavMap:
         z10 = self.terrain[i00 + 1]
         z01 = self.terrain[i00 + self.nx]
         z11 = self.terrain[i00 + self.nx + 1]
-        return ((z00 * (1.0 - dx) + z10 * dx) * (1.0 - dy) +
-                (z01 * (1.0 - dx) + z11 * dx) * dy) * 0.01
+        return (
+            (z00 * (1.0 - dx) + z10 * dx) * (1.0 - dy)
+            + (z01 * (1.0 - dx) + z11 * dx) * dy
+        ) * 0.01
 
     @staticmethod
     def _in_poly(x, y, ring):
@@ -114,12 +116,6 @@ class NavMap:
                 return False
         return True
 
-    def is_solid_point(self, x, y, z):
-        for p in self.prisms:
-            if self._point_in_prism(x, y, z, p):
-                return True
-        return False
-
     def _build_nav_grid(self, bounds, config):
         gs = self.gs
         x0 = bounds.get("minX", self.min_x)
@@ -136,7 +132,6 @@ class NavMap:
         walk = [False] * total
         cell_z = [0.0] * total
 
-        # Bin prisms into coarse 32m buckets for fast startup
         b_size = 32.0
         buckets = {}
         for p in self.prisms:
@@ -148,25 +143,25 @@ class NavMap:
                 for by in range(by0, by1 + 1):
                     buckets.setdefault((bx, by), []).append(p)
 
-        offsets = ((0.0, 0.0), (1.8, 0.0), (-1.8, 0.0), (0.0, 1.8), (0.0, -1.8))
+        offsets = ((0.0, 0.0), (1.6, 0.0), (-1.6, 0.0), (0.0, 1.6), (0.0, -1.6))
         for gy in range(self.gh):
             cy = (self.gy_min + gy + 0.5) * gs
             by = int(math.floor(cy / b_size))
             row = gy * self.gw
             for gx in range(self.gw):
                 cx = (self.gx_min + gx + 0.5) * gs
-                if cx < x0 + 3.0 or cx > x1 - 3.0 or cy < y0 + 3.0 or cy > y1 - 3.0:
+                if cx < x0 + 2.8 or cx > x1 - 2.8 or cy < y0 + 2.8 or cy > y1 - 2.8:
                     continue
                 gz = self.ground_z(cx, cy)
                 cell_z[row + gx] = gz
                 cand = buckets.get((int(math.floor(cx / b_size)), by), ())
                 blocked = False
                 for p in cand:
-                    if gz + 8.5 <= p["base"] + 1.2 or gz >= p["top"]:
+                    if gz + 8.8 <= p["base"] + 1.2 or gz >= p["top"]:
                         continue
                     for ox, oy in offsets:
                         px, py = cx + ox, cy + oy
-                        if self._point_in_prism(px, py, gz + 2.5, p) or self._point_in_prism(px, py, gz + 7.5, p):
+                        if self._point_in_prism(px, py, gz + 2.0, p) or self._point_in_prism(px, py, gz + 7.8, p):
                             blocked = True
                             break
                     if blocked:
@@ -174,7 +169,6 @@ class NavMap:
                 if not blocked:
                     walk[row + gx] = True
 
-        # Build 8-connected adjacency checking slope/step-up
         adj = [[] for _ in range(total)]
         dirs = (
             (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
@@ -198,9 +192,8 @@ class NavMap:
                             if not (walk[row + nx] and walk[ny * self.gw + gx]):
                                 continue
                         dz = cell_z[v] - zu
-                        # Max slope ~50 deg over 8m -> ~9m; allow jumping up to 6m ledges
-                        if dz <= 8.5 * cost:
-                            extra = 1.5 if dz > 1.3 else 0.0
+                        if dz <= 6.8 * cost:
+                            extra = 1.4 if dz > 1.2 else 0.0
                             nbrs.append((v, cost + extra))
 
         self.walkable = walk
@@ -222,7 +215,7 @@ class NavMap:
         if self.walkable[c]:
             return c
         gy0, gx0 = divmod(c, self.gw)
-        for r in range(1, 10):
+        for r in range(1, 12):
             for dy in range(-r, r + 1):
                 ny = gy0 + dy
                 if not (0 <= ny < self.gh):
@@ -237,32 +230,34 @@ class NavMap:
                             return idx
         return -1
 
+    def line_walkable(self, x0, y0, x1, y1):
+        if not self.walkable:
+            return True
+        dist = math.hypot(x1 - x0, y1 - y0)
+        steps = max(2, int(dist / 3.5))
+        for i in range(1, steps + 1):
+            t = i / steps
+            if not self.walkable[self.world_to_cell(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)]:
+                return False
+        return True
+
     def find_path_dir(self, start_pos, goal_xy, avoid_xy=None, avoid_r=0.0):
-        """Fast bounded A* on the precomputed nav graph; returns unit (dx, dy) for next waypoint."""
+        dx = goal_xy[0] - start_pos[0]
+        dy = goal_xy[1] - start_pos[1]
+        d = math.hypot(dx, dy)
+        if d < 1e-4:
+            return 0.0, 0.0
         if not self.walkable or not self.adj:
-            dx = goal_xy[0] - start_pos[0]
-            dy = goal_xy[1] - start_pos[1]
-            d = math.hypot(dx, dy)
-            return (dx / d, dy / d) if d > 1e-4 else (0.0, 0.0)
+            return dx / d, dy / d
+
+        if d < 36.0 and avoid_r <= 0.0 and self.line_walkable(start_pos[0], start_pos[1], goal_xy[0], goal_xy[1]):
+            return dx / d, dy / d
 
         s = self.nearest_walkable(start_pos[0], start_pos[1])
         g = self.nearest_walkable(goal_xy[0], goal_xy[1])
         if s < 0 or g < 0 or s == g:
-            dx = goal_xy[0] - start_pos[0]
-            dy = goal_xy[1] - start_pos[1]
-            d = math.hypot(dx, dy)
-            return (dx / d, dy / d) if d > 1e-4 else (0.0, 0.0)
+            return dx / d, dy / d
 
-        # Direct line check if close and unobstructed
-        if self.d2(start_pos, goal_xy) < 24.0:
-            mx, my = (start_pos[0] + goal_xy[0]) * 0.5, (start_pos[1] + goal_xy[1]) * 0.5
-            if self.walkable[self.world_to_cell(mx, my)]:
-                dx = goal_xy[0] - start_pos[0]
-                dy = goal_xy[1] - start_pos[1]
-                d = math.hypot(dx, dy)
-                return (dx / d, dy / d) if d > 1e-4 else (0.0, 0.0)
-
-        import heapq
         gy_g, gx_g = divmod(g, self.gw)
         open_heap = [(0.0, s)]
         came_from = {s: -1}
@@ -280,14 +275,15 @@ class NavMap:
             av_gy = int(math.floor(avoid_xy[1] / self.gs)) - self.gy_min
             av_r_cells = avoid_r / self.gs
 
-        while open_heap and expansions < 900:
+        while open_heap and expansions < 1100:
             _, cur = heapq.heappop(open_heap)
             if cur == g:
                 best_node = g
                 break
             expansions += 1
             cy, cx = divmod(cur, gw)
-            h_cur = math.hypot(gx_g - cx, gy_g - cy)
+            adx, ady = abs(gx_g - cx), abs(gy_g - cy)
+            h_cur = max(adx, ady) + 0.414 * min(adx, ady)
             if h_cur < best_h:
                 best_h = h_cur
                 best_node = cur
@@ -299,33 +295,38 @@ class NavMap:
                     ny, nx = divmod(nxt, gw)
                     ad = math.hypot(nx - av_gx, ny - av_gy)
                     if ad < av_r_cells:
-                        pen = (av_r_cells - ad) * 2.5
+                        pen = (av_r_cells - ad) * 3.0
                 ng = gc + step_cost + pen
                 if ng < g_score.get(nxt, 1e9):
                     g_score[nxt] = ng
                     came_from[nxt] = cur
                     ny, nx = divmod(nxt, gw)
-                    h = math.hypot(gx_g - nx, gy_g - ny)
-                    heapq.heappush(open_heap, (ng + h * 1.15, nxt))
+                    ddx, ddy = abs(gx_g - nx), abs(gy_g - ny)
+                    h = max(ddx, ddy) + 0.414 * min(ddx, ddy)
+                    heapq.heappush(open_heap, (ng + h * 1.12, nxt))
 
-        # Backtrack to the 2nd node along path for smooth cornering
+        path = []
         curr = best_node
-        prev = curr
-        prev2 = curr
-        while curr != s and curr in came_from:
-            prev2 = prev
-            prev = curr
+        while curr != -1 and curr in came_from:
+            path.append(curr)
             curr = came_from[curr]
+        path.reverse()
 
-        target_cell = prev2 if prev2 != s else prev
+        if len(path) <= 1:
+            return dx / d, dy / d
+
+        # String-pull up to 4 waypoints ahead for smooth diagonal cornering
+        target_cell = path[1]
+        for idx in range(min(4, len(path) - 1), 1, -1):
+            wx, wy = self.cell_to_world(path[idx])
+            if self.line_walkable(start_pos[0], start_pos[1], wx, wy):
+                target_cell = path[idx]
+                break
+
         wx, wy = self.cell_to_world(target_cell)
-        dx, dy = wx - start_pos[0], wy - start_pos[1]
-        d = math.hypot(dx, dy)
-        return (dx / d, dy / d) if d > 1e-4 else (0.0, 0.0)
-
-    @staticmethod
-    def d2(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
+        wdx, wdy = wx - start_pos[0], wy - start_pos[1]
+        wd = math.hypot(wdx, wdy)
+        return (wdx / wd, wdy / wd) if wd > 1e-4 else (dx / d, dy / d)
 
     def has_los(self, p1, p2):
         if not self.prisms and not self.terrain:
@@ -334,7 +335,7 @@ class NavMap:
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
         if dist < 4.0:
             return True
-        steps = min(32, max(4, int(dist / 5.5)))
+        steps = min(36, max(4, int(dist / 5.0)))
         min_x, max_x = min(p1[0], p2[0]), max(p1[0], p2[0])
         min_y, max_y = min(p1[1], p2[1]), max(p1[1], p2[1])
         min_z, max_z = min(p1[2], p2[2]), max(p1[2], p2[2])
@@ -351,15 +352,65 @@ class NavMap:
             x = p1[0] + dx * t
             y = p1[1] + dy * t
             z = p1[2] + dz * t
-            if self.terrain and z < self.ground_z(x, y) - 0.25:
+            if self.terrain and z < self.ground_z(x, y) - 0.2:
                 return False
             for p in cand:
                 if self._point_in_prism(x, y, z, p):
                     return False
         return True
 
+    def mortar_arc_clear(self, muzzle, target, speed, pitch, yaw, g=22.0):
+        if not self.prisms:
+            return True
+        cp = math.cos(pitch)
+        vx = speed * cp * math.cos(yaw)
+        vy = speed * cp * math.sin(yaw)
+        vz = speed * math.sin(pitch)
+        horiz = math.hypot(target[0] - muzzle[0], target[1] - muzzle[1])
+        t_total = horiz / max(speed * cp, 1.0)
+        if t_total <= 0.1 or t_total > 6.5:
+            return False
+        for i in range(1, 11):
+            t = (i / 11.0) * t_total
+            x = muzzle[0] + vx * t
+            y = muzzle[1] + vy * t
+            z = muzzle[2] + vz * t - 0.5 * g * t * t
+            if self.terrain and z < self.ground_z(x, y):
+                return False
+            for p in self.prisms:
+                if self._point_in_prism(x, y, z, p):
+                    return False
+        return True
 
-class ValkyrieBot:
+
+class ValkyrieApex:
+    UPGRADE_SCORES = {
+        "nanites": 100,
+        "armor": 96,
+        "plating": 92,
+        "servos": 88,
+        "gyros": 84,
+        "jets": 80,
+        "reactor": 76,
+        "capacitor": 72,
+        "sensors": 68,
+        "laser_charge": 86,
+        "laser_damage": 82,
+        "laser_pierce": 70,
+        "lightning_efficiency": 85,
+        "lightning_range": 83,
+        "lightning_chain": 75,
+        "mortar_reload": 84,
+        "mortar_splash": 80,
+        "mortar_velocity": 78,
+        "gun_damage": 74,
+        "gun_rate": 73,
+        "gun_velocity": 71,
+        "gun_mag": 66,
+    }
+
+    WEAPON_PRIORITY = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
+
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
         self.map = NavMap(hello.get("map", {}), self.cfg)
@@ -418,7 +469,7 @@ class ValkyrieBot:
         if pos:
             self.last_pos = list(pos)
 
-        if self.tick % 24 == 0:
+        if self.tick % 22 == 0:
             self.strafe_sign *= -1.0
 
         for m in obs.get("mechs", []):
@@ -440,22 +491,32 @@ class ValkyrieBot:
 
     def pick_upgrade(self, offer):
         choices = offer.get("choices", [])
-        held = {w["kind"] for w in self.me.get("weapons", []) if w}
-        order = ["armor", "hp", "regen", "speed", "boost", "energy", "damage", "rate", "cooldown", "sensors"]
         best_i, best_s = 0, -1
         for i, c in enumerate(choices):
             cid = c.get("id", "").lower()
-            s = 1
-            for r, key in enumerate(reversed(order)):
-                if key in cid:
-                    s = r + 10
-                    break
-            for wk in held:
-                if wk in cid:
-                    s += 6
+            s = self.UPGRADE_SCORES.get(cid, 50)
             if s > best_s:
                 best_s, best_i = s, i
         return best_i
+
+    def live_zone(self):
+        z = self.zone
+        c0 = z.get("center", [0.0, 0.0])
+        r0 = z.get("radius", 560.0)
+        c1 = z.get("next_center", c0)
+        r1 = z.get("next_radius", r0)
+        ts = z.get("shrink_start", 60.0)
+        te = z.get("shrink_end", 110.0)
+        if self.t <= ts or te <= ts:
+            alpha = 0.0
+        elif self.t >= te:
+            alpha = 1.0
+        else:
+            alpha = (self.t - ts) / (te - ts)
+        cx = c0[0] + (c1[0] - c0[0]) * alpha
+        cy = c0[1] + (c1[1] - c0[1]) * alpha
+        cr = r0 + (r1 - r0) * alpha
+        return (cx, cy), cr, (c1[0], c1[1]), r1, ts, te
 
     def aim_at(self, tpos, tvel, z_offset, wk, ws):
         pos = self.me["pos"]
@@ -479,6 +540,8 @@ class ValkyrieBot:
             spd = max(ws.get("speed", 72.0), 1.0)
             g = ws.get("gravity", 22.0)
             tf = dist / (spd * 0.82)
+            pitch = 0.7854
+            px, py = dx, dy
             for _ in range(2):
                 px = tx + tvel[0] * tf - mx
                 py = ty + tvel[1] * tf - my
@@ -497,25 +560,23 @@ class ValkyrieBot:
         return math.atan2(dy, dx), math.atan2(dz, dist)
 
     def find_cover_spot(self, pos, zc, zr, threats):
-        if self.cover_spot and (self.t - self.cover_spot_t < 2.5) and self.d2(self.cover_spot, zc) < zr * 0.9:
+        if self.cover_spot and (self.t - self.cover_spot_t < 2.2) and self.d2(self.cover_spot, zc) < zr * 0.9:
             return self.cover_spot
-
         if not self.map.walkable or not threats:
             return None
 
         best_xy = None
         best_score = -1e9
-        for ang_deg in range(0, 360, 30):
+        for ang_deg in range(0, 360, 24):
             rad = math.radians(ang_deg)
-            for rad_dist in (18.0, 32.0):
+            for rad_dist in (16.0, 28.0, 42.0):
                 cx = pos[0] + math.cos(rad) * rad_dist
                 cy = pos[1] + math.sin(rad) * rad_dist
-                if self.d2((cx, cy), zc) > zr * 0.85:
+                if self.d2((cx, cy), zc) > zr * 0.86:
                     continue
-                cell = self.map.world_to_cell(cx, cy)
-                if not self.map.walkable[cell]:
+                if not self.map.walkable[self.map.world_to_cell(cx, cy)]:
                     continue
-                cz = self.map.ground_z(cx, cy) + 6.0
+                cz = self.map.ground_z(cx, cy) + 6.5
                 hidden = True
                 min_td = 999.0
                 for e in threats:
@@ -526,7 +587,7 @@ class ValkyrieBot:
                     if self.map.has_los([ep[0], ep[1], ep[2] + 8.0], [cx, cy, cz]):
                         hidden = False
                         break
-                sc = (120.0 if hidden else 0.0) + min(min_td, 120.0) - self.d2((cx, cy), zc) * 0.25
+                sc = (140.0 if hidden else 0.0) + min(min_td, 130.0) - self.d2((cx, cy), zc) * 0.25
                 if sc > best_score:
                     best_score = sc
                     best_xy = (cx, cy)
@@ -543,26 +604,25 @@ class ValkyrieBot:
         e_weaps = set(e.get("weapons", []))
         e_aim = e.get("aim", [0.0, 0.0])[0]
 
-        score = 200.0 - ed
-        # Huge bonus for finishing low HP enemies (eliminates threat + drops cubes)
-        if hp < 350:
-            score += 110.0
+        score = 210.0 - ed
+        if hp < 340:
+            score += 120.0
         elif hp < 650:
             score += 45.0
 
-        # Weapon triangle counter bonus
+        # Weapon triangle counters
         if "laser" in held and "mortar" in e_weaps:
-            score += 65.0
+            score += 70.0
         if "lightning" in held and "laser" in e_weaps:
-            score += 65.0
+            score += 70.0
         if "mortar" in held and "lightning" in e_weaps:
-            score += 55.0
+            score += 60.0
 
-        # Rear-arc bonus (1.5x damage when hitting outside their front 180 deg)
+        # Rear-arc 1.5x damage opportunity
         to_me = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
         ang_diff = abs((to_me - e_aim + math.pi) % (2 * math.pi) - math.pi)
         if ang_diff > math.pi * 0.55:
-            score += 45.0
+            score += 50.0
 
         return score
 
@@ -589,6 +649,8 @@ class ValkyrieBot:
             grounded = me.get("grounded", True)
             in_zone = me.get("in_zone", True)
             cubes_cnt = me.get("cubes", 0)
+            stats = me.get("stats", {})
+            walk_spd = max(stats.get("walk_speed", 11.7), 5.0)
             weapons = list(me.get("weapons", [None, None]))
             while len(weapons) < 2:
                 weapons.append(None)
@@ -598,30 +660,39 @@ class ValkyrieBot:
 
             held = [w["kind"] for w in weapons if w]
             empty = [i for i, w in enumerate(weapons) if w is None]
+            laser_charging = any(w and w.get("kind") == "laser" and w.get("charge", 0.0) > 0.0 for w in weapons)
 
-            # 1. Weapon Pickup / Triangle Counter Swap
+            # 1. Weapon Loot & Smart Loadout Upgrade
             near_pickup = None
+            best_p_prio = 0
             for p in self.pickups:
                 pk = p.get("kind")
                 if pk in held:
                     continue
                 d = self.d2(pos, p["pos"])
                 dz = abs(pos[2] - p["pos"][2])
-                if d <= 3.85 and dz <= 3.85:
+                p_prio = self.WEAPON_PRIORITY.get(pk, 1)
+                if d <= 3.85 and dz <= 3.85 and not laser_charging:
                     if empty:
                         act["take"] = p["id"]
                         break
-                    for idx, w in enumerate(weapons):
-                        if w and w["kind"] == "gun":
-                            act["take"] = p["id"]
-                            act["drop"] = idx
-                            break
-                elif empty and d < 34.0 and dz <= 4.5:
+                    # Replace lowest-priority held weapon if pickup is strictly higher tier
+                    worst_idx = min((0, 1), key=lambda i: self.WEAPON_PRIORITY.get(weapons[i]["kind"], 0))
+                    if p_prio > self.WEAPON_PRIORITY.get(weapons[worst_idx]["kind"], 0):
+                        act["take"] = p["id"]
+                        act["drop"] = worst_idx
+                        break
+                elif empty and d < 36.0 and dz <= 4.5 and p_prio > best_p_prio:
+                    best_p_prio = p_prio
                     near_pickup = p
 
-            # 2. Perception & 3D Line of Sight
-            eye = [pos[0], pos[1], pos[2] + me.get("stats", {}).get("eye_height", 8.0)]
+            # 2. Perception: Muzzle LOS + Indirect Mortar Candidates
+            muzzle_h = stats.get("muzzle_height", 7.0)
+            muzzle = [pos[0], pos[1], pos[2] + muzzle_h]
+            eye = [pos[0], pos[1], pos[2] + stats.get("eye_height", 8.0)]
+
             vis_enemies = []
+            mortar_enemies = []
             nearest_any = None
             nearest_any_d = 9999.0
 
@@ -630,83 +701,101 @@ class ValkyrieBot:
                 if d < nearest_any_d:
                     nearest_any_d = d
                     nearest_any = e
-                t_center = [e["pos"][0], e["pos"][1], e["pos"][2] + 5.0]
-                if d <= 210.0 and self.map.has_los(eye, t_center):
+                t_center = [e["pos"][0], e["pos"][1], e["pos"][2] + 4.8]
+                if d <= 215.0 and self.map.has_los(muzzle, t_center):
                     vis_enemies.append(e)
+                elif "mortar" in held and 28.0 <= d <= 195.0:
+                    mortar_enemies.append(e)
 
-            # 3. Zone, Healing & Tactical Positioning
-            zc = self.zone.get("next_center", self.zone.get("center", [0.0, 0.0]))
-            zr = self.zone.get("next_radius", self.zone.get("radius", 300.0))
-            zdist = self.d2(pos, zc)
-            zone_urgent = (not in_zone) or (zdist > zr * 0.85)
-            out_of_combat_s = self.t - max(self.last_damage_t, self.last_hit_t)
-            healing_mode = (hp_ratio < 0.72) and (self.t > 12.0)
+            # 3. Live Zone Pacing
+            cur_zc, cur_zr, next_zc, next_zr, shrink_s, shrink_e = self.live_zone()
+            dist_cur_zc = self.d2(pos, cur_zc)
+            dist_next_zc = self.d2(pos, next_zc)
+            dist_to_next_edge = max(0.0, dist_next_zc - next_zr * 0.85)
+            travel_time_needed = dist_to_next_edge / walk_spd
+            time_until_closed = max(0.0, shrink_e - self.t)
 
-            # Safe zone anchor biased away from enemies
-            anchor_x, anchor_y = zc[0], zc[1]
-            if nearest_any and zr > 40.0:
+            zone_urgent = (
+                (not in_zone)
+                or (dist_cur_zc > cur_zr - 12.0)
+                or (dist_to_next_edge > 0.0 and time_until_closed <= travel_time_needed + 7.0)
+            )
+            healing_mode = (hp_ratio < 0.74) and (self.t > 10.0)
+
+            # Anchor inside next safe circle offset away from nearest threat
+            anchor_x, anchor_y = next_zc[0], next_zc[1]
+            if nearest_any and next_zr > 35.0:
                 ax, ay = pos[0] - nearest_any["pos"][0], pos[1] - nearest_any["pos"][1]
                 ad = max(math.hypot(ax, ay), 0.1)
-                off = min(zr * 0.45, 65.0)
-                anchor_x = zc[0] + (ax / ad) * off
-                anchor_y = zc[1] + (ay / ad) * off
+                off = min(next_zr * 0.48, 68.0)
+                anchor_x = next_zc[0] + (ax / ad) * off
+                anchor_y = next_zc[1] + (ay / ad) * off
 
-            # Check uncontested supply drops (3 cubes + FULL HP + FULL ENERGY!)
+            # Uncontested supply drops (full HP + full energy + 3 cubes)
             best_drop = None
             if not zone_urgent:
                 for dr in self.drops:
-                    if dr.get("lands_in", 99) <= 10.0 and (dr.get("holder") in (None, me.get("id")) or self.d2(pos, dr["pos"]) < 15.0):
+                    if dr.get("lands_in", 99) <= 10.0 and (
+                        dr.get("holder") in (None, me.get("id")) or self.d2(pos, dr["pos"]) < 14.0
+                    ):
                         dd = self.d2(pos, dr["pos"])
                         if dd < 85.0 and (not nearest_any or nearest_any_d > 38.0 or hp_ratio < 0.65):
                             best_drop = dr
                             break
 
-            # Select Combat Target first so movement & aim coordinate
+            # 4. Target Selection
             target = None
             target_z_off = 4.8
             is_crate = False
+            indirect_mortar = False
 
             if vis_enemies:
                 best_e = max(vis_enemies, key=lambda e: self.score_target(e, pos, held))
                 ed = self.d2(pos, best_e["pos"])
-                # If healing behind cover and enemy is far, hold fire so 45 HP/s regen triggers
-                if not healing_mode or ed < 75.0 or best_e.get("hp", 999) < 260:
+                if not healing_mode or ed < 75.0 or best_e.get("hp", 999) < 280:
                     target = best_e
+            elif mortar_enemies and not healing_mode and not zone_urgent:
+                best_me = max(mortar_enemies, key=lambda e: self.score_target(e, pos, held))
+                target = best_me
+                indirect_mortar = True
             elif not healing_mode and cubes_cnt < 10 and (not nearest_any or nearest_any_d > 80.0):
-                # Safe PvE farming up to stat_cap (10 cubes)
                 for n in sorted(self.npcs.values(), key=lambda x: self.d2(pos, x["pos"])):
                     nd = self.d2(pos, n["pos"])
-                    if nd < 65.0 and self.map.has_los(eye, [n["pos"][0], n["pos"][1], n["pos"][2] + 2.0]):
+                    if nd < 65.0 and self.map.has_los(muzzle, [n["pos"][0], n["pos"][1], n["pos"][2] + 2.0]):
                         target, target_z_off = n, 1.8
                         break
                 if not target:
                     for c in sorted(self.crates, key=lambda x: self.d2(pos, x["pos"])):
                         cd = self.d2(pos, c["pos"])
-                        if cd < 35.0 and self.map.has_los(eye, [c["pos"][0], c["pos"][1], c["pos"][2] + 1.5]):
+                        if cd < 35.0 and self.map.has_los(muzzle, [c["pos"][0], c["pos"][1], c["pos"][2] + 1.5]):
                             target, target_z_off, is_crate = c, 1.5, True
                             break
 
-            # Movement State Machine
+            # 5. Movement & Stealth Pacing
             use_astar = False
             stealth_hold = False
+            silent_walk = False
             gx, gy = anchor_x, anchor_y
 
             if zone_urgent:
-                gx, gy = zc[0], zc[1]
+                gx, gy = next_zc[0], next_zc[1]
                 use_astar = True
-                if energy > 35 and zdist > 16.0:
+                if energy > 35 and dist_to_next_edge > 14.0:
                     act["boost"] = True
-            elif healing_mode and (vis_enemies or (nearest_any and nearest_any_d < 90.0)):
-                cov = self.find_cover_spot(pos, zc, zr, list(self.enemies.values()))
+            elif healing_mode and (vis_enemies or (nearest_any and nearest_any_d < 95.0)):
+                cov = self.find_cover_spot(pos, next_zc, next_zr, list(self.enemies.values()))
                 if cov:
                     gx, gy = cov
                     use_astar = True
-                    if self.d2(pos, cov) < 4.5 and not vis_enemies:
+                    cd_cov = self.d2(pos, cov)
+                    if cd_cov < 4.5 and not vis_enemies:
                         stealth_hold = True
+                    elif not vis_enemies and nearest_any_d < 45.0:
+                        silent_walk = True
                 else:
                     gx, gy = anchor_x, anchor_y
                     use_astar = True
-                if not stealth_hold and energy > 30 and nearest_any_d < 55.0:
+                if not stealth_hold and not silent_walk and energy > 30 and vis_enemies:
                     act["boost"] = True
             elif best_drop:
                 gx, gy = best_drop["pos"][0], best_drop["pos"][1]
@@ -716,7 +805,10 @@ class ValkyrieBot:
                 if self.d2(pos, best_drop["pos"]) < 3.5:
                     stealth_hold = True
             elif any(abs(c["pos"][2] - pos[2]) <= 4.5 for c in self.cubes):
-                nc = min((c for c in self.cubes if abs(c["pos"][2] - pos[2]) <= 4.5), key=lambda c: self.d2(pos, c["pos"]))
+                nc = min(
+                    (c for c in self.cubes if abs(c["pos"][2] - pos[2]) <= 4.5),
+                    key=lambda c: self.d2(pos, c["pos"]),
+                )
                 if self.d2(pos, nc["pos"]) < 34.0 and (not nearest_any or nearest_any_d > 42.0):
                     gx, gy = nc["pos"][0], nc["pos"][1]
                     use_astar = True
@@ -730,10 +822,10 @@ class ValkyrieBot:
                 uy = (epos[1] - pos[1]) / max(ed, 0.1)
                 px, py = -uy * self.strafe_sign, ux * self.strafe_sign
 
-                ideal = 24.0 if "lightning" in held else (65.0 if "laser" in held else 48.0)
+                ideal = 24.0 if "lightning" in held else (68.0 if "laser" in held else 48.0)
                 if ed < ideal - 8.0:
                     gx, gy = pos[0] - ux * 16.0 + px * 18.0, pos[1] - uy * 16.0 + py * 18.0
-                elif ed > ideal + 14.0 and (self.alive <= 6 or target.get("hp", 999) < 350):
+                elif ed > ideal + 14.0 and (self.alive <= 6 or target.get("hp", 999) < 340):
                     gx, gy = pos[0] + ux * 15.0 + px * 15.0, pos[1] + uy * 15.0 + py * 15.0
                 else:
                     gx, gy = pos[0] + px * 20.0, pos[1] + py * 20.0
@@ -741,11 +833,12 @@ class ValkyrieBot:
                 if self.d2(pos, (anchor_x, anchor_y)) > 16.0:
                     gx, gy = anchor_x, anchor_y
                     use_astar = True
+                    if nearest_any and nearest_any_d < 45.0:
+                        silent_walk = True
                 else:
-                    # Silent hold inside safe zone: 0 footsteps, full 360 scan, full HP regen!
                     stealth_hold = True
 
-            # Projectile Dodge Override
+            # Projectile & Enemy Laser-Charge Dodge Override
             dx_dodge, dy_dodge = 0.0, 0.0
             for pr in self.projectiles:
                 pp, pv = pr["pos"], pr["vel"]
@@ -757,10 +850,27 @@ class ValkyrieBot:
                     if rx * vx + ry * vy > 0:
                         px, py = -vy, vx
                         side = 1.0 if (rx * px + ry * py) >= 0 else -1.0
-                        dx_dodge += px * side * 26.0
-                        dy_dodge += py * side * 26.0
+                        dx_dodge += px * side * 28.0
+                        dy_dodge += py * side * 28.0
                         stealth_hold = False
-                        if energy > 25 and pd < 16.0:
+                        silent_walk = False
+                        if energy > 22 and pd < 18.0:
+                            act["boost"] = True
+
+            for e in vis_enemies:
+                if e.get("charging"):
+                    ep = e["pos"]
+                    e_yaw = e.get("aim", [0.0, 0.0])[0]
+                    to_us = math.atan2(pos[1] - ep[1], pos[0] - ep[0])
+                    if abs((to_us - e_yaw + math.pi) % (2 * math.pi) - math.pi) < 0.32:
+                        rx, ry = pos[0] - ep[0], pos[1] - ep[1]
+                        rd = max(math.hypot(rx, ry), 0.1)
+                        px, py = -ry / rd, rx / rd
+                        dx_dodge += px * self.strafe_sign * 32.0
+                        dy_dodge += py * self.strafe_sign * 32.0
+                        stealth_hold = False
+                        silent_walk = False
+                        if energy > 22:
                             act["boost"] = True
 
             if stealth_hold:
@@ -777,20 +887,24 @@ class ValkyrieBot:
                     ry = (gy - pos[1]) + dy_dodge
                     rm = math.hypot(rx, ry)
                     mx, my = (rx / rm, ry / rm) if rm > 1e-4 else (0.0, 0.0)
-                    # Local obstacle guard during combat strafing
                     if self.map.walkable and not self.map.walkable[self.map.world_to_cell(pos[0] + mx * 6.0, pos[1] + my * 6.0)]:
                         mx, my = -mx, -my
 
+                if silent_walk and not act["boost"]:
+                    # Keep ground speed < 5.0 m/s (sound.step_speed) for zero footstep emissions
+                    scale = min(0.40, 4.6 / walk_spd)
+                    mx *= scale
+                    my *= scale
+
                 act["move"] = [round(mx, 4), round(my, 4)]
 
-                # Unstick via jump-jet if physically blocked
                 if self.stuck_ticks >= 5 and energy > 22:
                     if grounded:
                         act["jump"] = True
                     else:
                         act["boost"] = True
 
-            # 4. Per-Weapon Independent Aiming & Firing
+            # 6. Per-Weapon Independent Aiming & Firing
             if target:
                 tpos = target["pos"]
                 tvel = target.get("vel", [0.0, 0.0, 0.0])
@@ -813,27 +927,53 @@ class ValkyrieBot:
                         if ammo == 0 or (ammo <= 3 and tdist > 85.0 and w.get("reload", 0) == 0):
                             act["reload"] = True
 
-                    # Aim mortar at feet (+0.8m) so ground impact triggers 7m splash + concuss!
+                    if indirect_mortar and wk != "mortar":
+                        continue
+
                     z_off = 0.8 if wk == "mortar" else target_z_off
                     ay, ap = self.aim_at(tpos, tvel, z_off, wk, ws)
                     slot_aims[idx] = (ay, ap)
 
                     if wk == "laser":
-                        slot_ready[idx] = (cd <= 0.2 and tdist <= ws.get("range", 280.0) and not zone_urgent and not healing_mode)
+                        slot_ready[idx] = (
+                            cd <= 0.2
+                            and not indirect_mortar
+                            and tdist <= ws.get("range", 280.0)
+                            and not zone_urgent
+                            and not healing_mode
+                        )
                     elif wk == "lightning":
-                        slot_ready[idx] = (cd <= 0.15 and tdist <= ws.get("range", 45.0) - 1.5 and energy > 12)
+                        slot_ready[idx] = (
+                            cd <= 0.15
+                            and not indirect_mortar
+                            and tdist <= ws.get("range", 45.0) - 1.5
+                            and energy > 12
+                        )
                     elif wk == "mortar":
-                        slot_ready[idx] = (cd <= 0.2 and 18.0 <= tdist <= 225.0 and not is_crate)
+                        can_mortar = cd <= 0.2 and 18.0 <= tdist <= 220.0 and not is_crate
+                        if can_mortar and indirect_mortar:
+                            can_mortar = self.map.mortar_arc_clear(
+                                [pos[0], pos[1], pos[2] + muzzle_h + 2.5],
+                                tpos,
+                                ws.get("speed", 72.0),
+                                ap,
+                                ay,
+                                ws.get("gravity", 22.0),
+                            )
+                        slot_ready[idx] = can_mortar
                     else:
-                        slot_ready[idx] = (cd <= 0.2 and w.get("reload", 0) <= 0 and tdist <= ws.get("range", 230.0))
+                        slot_ready[idx] = (
+                            cd <= 0.2
+                            and not indirect_mortar
+                            and w.get("reload", 0) <= 0
+                            and tdist <= ws.get("range", 230.0)
+                        )
 
-                # Pick primary aim slot (prioritize charging/ready laser > lightning > mortar > gun)
-                prio = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
                 chosen_slot = None
                 best_p = -1
                 for idx in (0, 1):
                     if slot_ready[idx] and weapons[idx]:
-                        p = prio.get(weapons[idx].get("kind", "gun"), 0)
+                        p = self.WEAPON_PRIORITY.get(weapons[idx].get("kind", "gun"), 0)
                         if weapons[idx].get("kind") == "laser" and weapons[idx].get("charge", 0) > 0:
                             p += 5
                         if p > best_p:
@@ -849,7 +989,6 @@ class ValkyrieBot:
                     des_y, des_p = slot_aims[chosen_slot]
                     act["aim"] = [round(des_y, 4), round(des_p, 4)]
 
-                    # Only fire each slot if ACTUAL torso aim matches THAT slot's required yaw & pitch!
                     for idx in (0, 1):
                         if not slot_ready[idx] or slot_aims[idx] is None:
                             continue
@@ -863,10 +1002,12 @@ class ValkyrieBot:
                             ch = weapons[idx].get("charge", 0.0)
                             max_c = ws.get("charge", 0.75)
                             min_c = ws.get("min_charge", 0.15)
-                            if (ch >= max_c * 0.88 or (ch >= min_c and target.get("hp", 999) < 120)) and yerr < 0.11 and perr < 0.11:
-                                act["fire"][idx] = False
-                            else:
-                                act["fire"][idx] = True
+                            ready_release = (
+                                (ch >= max_c * 0.88 and yerr < 0.12 and perr < 0.12)
+                                or (ch >= max_c * 0.96 and yerr < 0.22)
+                                or (ch >= min_c and target.get("hp", 999) < 120 and yerr < 0.11 and perr < 0.11)
+                            )
+                            act["fire"][idx] = not ready_release
                         elif wk == "lightning":
                             if yerr < 0.24 and perr < 0.30:
                                 act["fire"][idx] = True
@@ -877,13 +1018,11 @@ class ValkyrieBot:
                             if yerr < 0.16 and perr < 0.14:
                                 act["fire"][idx] = True
             else:
-                # Cancel any active laser charge when target is lost so full move speed is restored
                 for idx in (0, 1):
                     w = weapons[idx]
                     if w and w.get("kind") == "laser" and w.get("charge", 0) > 0:
                         act["fire"][idx] = False
 
-                # Protect 180-degree front arc from 1.5x rear-armor bonus
                 scan = None
                 for ev in self.events:
                     if ev.get("type") == "damaged" and ev.get("bearing") is not None:
@@ -930,8 +1069,8 @@ def main():
                 continue
             t = msg.get("type")
             if t == "hello":
-                bot = ValkyrieBot(msg)
-                print(json.dumps({"type": "ready", "name": "Valkyrie"}), flush=True)
+                bot = ValkyrieApex(msg)
+                print(json.dumps({"type": "ready", "name": "ValkyrieApex"}), flush=True)
             elif t == "obs":
                 latest_obs = msg
             elif t == "end":
